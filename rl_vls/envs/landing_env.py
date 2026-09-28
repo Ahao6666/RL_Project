@@ -26,7 +26,8 @@ class LandingEnv(gym.Env):
     def __init__(
         self,
         dt: float = 0.05,
-        tau_range: tuple = (0.2, 0.8),
+        tau_xy_range: tuple = (0.5, 2.0),
+        tau_z_range: tuple = (0.4, 1.5),
         max_episode_time: float = 40.0,
         v_xy_max: float = 2.0,
         v_down_max: float = 1.5,
@@ -45,15 +46,21 @@ class LandingEnv(gym.Env):
     ):
         """
         Args:
-            tau_range: 速度响应时间常数每回合的随机采样范围 (s)，
+            tau_xy_range: 水平速度响应时间常数每回合随机采样范围 (s)。
+                SITL 实测约 1.3s，默认范围取实测值两侧留余量；
                 传入 (t, t) 即固定值（用于压力测试）
+            tau_z_range: 垂直速度响应时间常数范围 (s)，SITL 实测约 0.95s
             low_alt_h: 低空速度惩罚生效的高度阈值 (m)
             low_alt_speed_w: 低空速度惩罚权重，随高度降低线性增大
         """
         super().__init__()
         self.dt = dt
-        self.tau_range = tau_range
-        self.tau = float(np.mean(tau_range))  # 占位值，reset 时随机采样
+        self.tau_xy_range = tau_xy_range
+        self.tau_z_range = tau_z_range
+        # 占位值，reset 时随机采样（[tau_x, tau_y, tau_z]）
+        self.tau_vec = np.array(
+            [np.mean(tau_xy_range), np.mean(tau_xy_range), np.mean(tau_z_range)]
+        )
         self.max_episode_time = max_episode_time
         self.v_xy_max = v_xy_max
         self.v_down_max = v_down_max
@@ -126,7 +133,10 @@ class LandingEnv(gym.Env):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         self._reset_state()
-        self.tau = float(self._rng.uniform(*self.tau_range))  # 每回合随机化动力学
+        # 每回合随机化动力学：水平/垂直独立采样（SITL 实测两者不同）
+        tau_xy = self._rng.uniform(*self.tau_xy_range)
+        tau_z = self._rng.uniform(*self.tau_z_range)
+        self.tau_vec = np.array([tau_xy, tau_xy, tau_z])
         h = self._rng.uniform(*self.h_init_range)
         # 保证初始时目标在视场内
         while True:
@@ -146,8 +156,8 @@ class LandingEnv(gym.Env):
                 (action[2] + 1.0) / 2.0 * (self.v_down_max + self.v_up_max) - self.v_up_max,
             ]
         )
-        # 一阶惯性速度跟踪 + 位置积分
-        self.vel += (v_cmd - self.vel) * (self.dt / self.tau)
+        # 一阶惯性速度跟踪（水平/垂直各自的时间常数）+ 位置积分
+        self.vel += (v_cmd - self.vel) * (self.dt / self.tau_vec)
         self.pos[0] += self.vel[0] * self.dt
         self.pos[1] += self.vel[1] * self.dt
         self.pos[2] -= self.vel[2] * self.dt  # v_down 为正时高度下降
