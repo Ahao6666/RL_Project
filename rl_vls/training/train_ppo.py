@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--timesteps", type=int, default=500_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-dir", type=str, default="runs/ppo_landing")
+    parser.add_argument("--save-dir", type=str, default="checkpoints")
     parser.add_argument("--device", type=str, default="cpu",
                         help="MlpPolicy 建议 cpu；SB3 默认 auto 会占用 GPU 但收益很小")
     args = parser.parse_args()
