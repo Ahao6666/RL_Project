@@ -8,7 +8,8 @@
 
 动作：期望速度指令 [v_right, v_forward, v_down]（归一化到 [-1, 1] 后按限幅缩放），
 对应 MAVROS /mavros/setpoint_velocity/cmd_vel_unstamped 的 NED 速度控制语义。
-动力学：一阶惯性环节模拟 ArduPilot guided 模式的速度跟踪响应。
+动力学：一阶惯性环节模拟 ArduPilot guided 模式的速度跟踪响应，
+时间常数 tau 每回合随机采样（domain randomization，覆盖真机响应不确定性）。
 """
 from __future__ import annotations
 
@@ -25,24 +26,34 @@ class LandingEnv(gym.Env):
     def __init__(
         self,
         dt: float = 0.05,
-        tau: float = 0.3,
+        tau_range: tuple = (0.2, 0.8),
         max_episode_time: float = 40.0,
         v_xy_max: float = 2.0,
         v_down_max: float = 1.5,
         v_up_max: float = 0.8,
         fov_half_deg: float = 50.0,
-        h_init_range: tuple = (4.0, 12.0),
-        xy_init_range: float = 3.0,
+        h_init_range: tuple = (3.0, 20.0),
+        xy_init_range: float = 5.0,
         land_h: float = 0.15,
         land_r_max: float = 0.3,
         land_v_max: float = 0.5,
+        low_alt_h: float = 2.0,
+        low_alt_speed_w: float = 1.0,
         lost_timeout: float = 2.0,
         noise_cfg: dict | None = None,
         seed: int | None = None,
     ):
+        """
+        Args:
+            tau_range: 速度响应时间常数每回合的随机采样范围 (s)，
+                传入 (t, t) 即固定值（用于压力测试）
+            low_alt_h: 低空速度惩罚生效的高度阈值 (m)
+            low_alt_speed_w: 低空速度惩罚权重，随高度降低线性增大
+        """
         super().__init__()
         self.dt = dt
-        self.tau = tau
+        self.tau_range = tau_range
+        self.tau = float(np.mean(tau_range))  # 占位值，reset 时随机采样
         self.max_episode_time = max_episode_time
         self.v_xy_max = v_xy_max
         self.v_down_max = v_down_max
@@ -53,6 +64,8 @@ class LandingEnv(gym.Env):
         self.land_h = land_h
         self.land_r_max = land_r_max
         self.land_v_max = land_v_max
+        self.low_alt_h = low_alt_h
+        self.low_alt_speed_w = low_alt_speed_w
         self.lost_timeout = lost_timeout
 
         self.noise = VisionNoiseModel(**(noise_cfg or {}))
@@ -113,6 +126,7 @@ class LandingEnv(gym.Env):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         self._reset_state()
+        self.tau = float(self._rng.uniform(*self.tau_range))  # 每回合随机化动力学
         h = self._rng.uniform(*self.h_init_range)
         # 保证初始时目标在视场内
         while True:
@@ -147,6 +161,9 @@ class LandingEnv(gym.Env):
 
         # 过程奖励：偏离中心、高度、水平速度的代价（按 dt 缩放与步长解耦）
         reward = -(1.0 * d_xy + 0.2 * h + 0.1 * float(np.hypot(*self.vel[:2]))) * self.dt
+        # 低空速度惩罚：低于 low_alt_h 后随高度降低线性增大，压低触地速度余量
+        if h < self.low_alt_h:
+            reward -= self.low_alt_speed_w * speed * (1.0 - h / self.low_alt_h) * self.dt
 
         terminated = False
         truncated = False
