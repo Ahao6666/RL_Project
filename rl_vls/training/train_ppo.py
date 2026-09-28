@@ -19,10 +19,21 @@ from rl_vls.envs.landing_env import LandingEnv
 # 视觉噪声参数：训练时可逐步加大（课程学习），或做 domain randomization
 NOISE_CFG = dict(sigma_dist=0.02, sigma_offaxis=0.05, sigma_floor=0.005, dropout_prob=0.02)
 
+# tau 默认围绕 SITL 实测值（xy≈1.3s, z≈0.95s）收窄采样，两侧留余量覆盖真机差异
+DEFAULT_TAU_XY = (0.9, 1.7)
+DEFAULT_TAU_Z = (0.7, 1.2)
 
-def make_env(seed: int = 0):
+
+def make_env(seed: int = 0, tau_xy=DEFAULT_TAU_XY, tau_z=DEFAULT_TAU_Z,
+             low_alt_speed_w: float = 2.0):
     def _init():
-        env = LandingEnv(noise_cfg=NOISE_CFG, seed=seed)
+        env = LandingEnv(
+            noise_cfg=NOISE_CFG,
+            tau_xy_range=tau_xy,
+            tau_z_range=tau_z,
+            low_alt_speed_w=low_alt_speed_w,
+            seed=seed,
+        )
         return Monitor(env)
 
     return _init
@@ -36,12 +47,20 @@ def main():
     parser.add_argument("--save-dir", type=str, default="checkpoints")
     parser.add_argument("--device", type=str, default="cpu",
                         help="MlpPolicy 建议 cpu；SB3 默认 auto 会占用 GPU 但收益很小")
+    parser.add_argument("--tau-xy", type=float, nargs=2, default=list(DEFAULT_TAU_XY),
+                        metavar=("MIN", "MAX"), help="水平 tau 采样范围 (s)")
+    parser.add_argument("--tau-z", type=float, nargs=2, default=list(DEFAULT_TAU_Z),
+                        metavar=("MIN", "MAX"), help="垂直 tau 采样范围 (s)")
+    parser.add_argument("--low-alt-speed-w", type=float, default=2.0,
+                        help="低空速度惩罚权重")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    train_env = VecNormalize(DummyVecEnv([make_env(args.seed)]), norm_obs=True, norm_reward=True)
-    eval_env = VecNormalize(DummyVecEnv([make_env(args.seed + 1000)]), norm_obs=True, norm_reward=False, training=False)
+    env_kwargs = dict(tau_xy=tuple(args.tau_xy), tau_z=tuple(args.tau_z),
+                      low_alt_speed_w=args.low_alt_speed_w)
+    train_env = VecNormalize(DummyVecEnv([make_env(args.seed, **env_kwargs)]), norm_obs=True, norm_reward=True)
+    eval_env = VecNormalize(DummyVecEnv([make_env(args.seed + 1000, **env_kwargs)]), norm_obs=True, norm_reward=False, training=False)
 
     model = PPO(
         "MlpPolicy",
