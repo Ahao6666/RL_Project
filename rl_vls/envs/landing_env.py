@@ -40,6 +40,8 @@ class LandingEnv(gym.Env):
         land_v_max: float = 0.5,
         low_alt_h: float = 2.0,
         low_alt_speed_w: float = 1.0,
+        action_smooth_w: float = 0.0,
+        action_delay_range: tuple = (0, 0),
         lost_timeout: float = 2.0,
         noise_cfg: dict | None = None,
         seed: int | None = None,
@@ -52,6 +54,10 @@ class LandingEnv(gym.Env):
             tau_z_range: 垂直速度响应时间常数范围 (s)，SITL 实测约 0.95s
             low_alt_h: 低空速度惩罚生效的高度阈值 (m)
             low_alt_speed_w: 低空速度惩罚权重，随高度降低线性增大
+            action_smooth_w: 动作平滑惩罚权重，惩罚 ||a_t - a_{t-1}||^2，
+                抑制 bang-bang 式振荡输出
+            action_delay_range: 控制延迟随机采样范围（步数，含端点），
+                模拟视觉+通信链路延迟；实测链路约 50~150ms（1~3 步）
         """
         super().__init__()
         self.dt = dt
@@ -73,6 +79,8 @@ class LandingEnv(gym.Env):
         self.land_v_max = land_v_max
         self.low_alt_h = low_alt_h
         self.low_alt_speed_w = low_alt_speed_w
+        self.action_smooth_w = action_smooth_w
+        self.action_delay_range = action_delay_range
         self.lost_timeout = lost_timeout
 
         self.noise = VisionNoiseModel(**(noise_cfg or {}))
@@ -102,6 +110,10 @@ class LandingEnv(gym.Env):
         self.t = 0.0
         self.lost_time = 0.0
         self.p_cam_meas = None
+        # 控制延迟缓冲（reset 时按 action_delay_range 采样延迟步数）
+        lo, hi = self.action_delay_range
+        self._action_delay = int(self._rng.integers(lo, hi + 1))
+        self._act_buf = [np.zeros(3)] * self._action_delay
 
     def _marker_in_fov(self, p_cam: np.ndarray) -> bool:
         off_axis = np.arctan2(np.hypot(p_cam[0], p_cam[1]), max(p_cam[2], 1e-6))
@@ -148,7 +160,7 @@ class LandingEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
-        v_cmd = np.array(
+        v_cmd_new = np.array(
             [
                 action[0] * self.v_xy_max,
                 action[1] * self.v_xy_max,
@@ -156,6 +168,11 @@ class LandingEnv(gym.Env):
                 (action[2] + 1.0) / 2.0 * (self.v_down_max + self.v_up_max) - self.v_up_max,
             ]
         )
+        # 控制延迟：指令进入缓冲，延迟 _action_delay 步后才作用于动力学
+        self._act_buf.append(v_cmd_new)
+        v_cmd = self._act_buf.pop(0)
+        # 动作平滑惩罚（在更新 prev_action 前计算差分）
+        smooth_pen = self.action_smooth_w * float(np.sum((action - self.prev_action) ** 2))
         # 一阶惯性速度跟踪（水平/垂直各自的时间常数）+ 位置积分
         self.vel += (v_cmd - self.vel) * (self.dt / self.tau_vec)
         self.pos[0] += self.vel[0] * self.dt
@@ -171,6 +188,8 @@ class LandingEnv(gym.Env):
 
         # 过程奖励：偏离中心、高度、水平速度的代价（按 dt 缩放与步长解耦）
         reward = -(1.0 * d_xy + 0.2 * h + 0.1 * float(np.hypot(*self.vel[:2]))) * self.dt
+        # 动作平滑惩罚：抑制 bang-bang 式振荡输出（不按 dt 缩放，逐步计）
+        reward -= smooth_pen
         # 低空速度惩罚：低于 low_alt_h 后随高度降低线性增大，压低触地速度余量
         if h < self.low_alt_h:
             reward -= self.low_alt_speed_w * speed * (1.0 - h / self.low_alt_h) * self.dt
