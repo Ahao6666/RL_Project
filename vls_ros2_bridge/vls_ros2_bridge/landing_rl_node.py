@@ -1,9 +1,9 @@
 """阶段 2 桥接节点：加载阶段 1 训练的 PPO 策略，闭环控制 ArduPilot。
 
 数据流：
-    /h_marker/position (Point, 相机光轴系 z前/x右/y下)        ─┐
-    /mavros/local_position/velocity_body (TwistStamped, FRD)  ├─> 观测组装 -> PPO
-    /mavros/local_position/pose (PoseStamped, 取 yaw)         ─┘
+    /mavros/local_position/velocity_body (TwistStamped, 实测为 FLU 系) ─┐
+    /mavros/local_position/pose (PoseStamped, 取 yaw)                  ├─> 观测组装 -> PPO
+    /h_marker/position (Point, 相机光轴系 z前/x右/y下)                  ─┘
     PPO 动作 [v_right, v_forward, v_down]
         -> 按 yaw 旋转到 ENU -> /mavros/setpoint_velocity/cmd_vel_unstamped
 
@@ -51,6 +51,26 @@ class LandingRLNode(Node):
         self.declare_parameter("v_xy_max", 2.0)
         self.declare_parameter("v_down_max", 1.5)
         self.declare_parameter("v_up_max", 0.8)
+        # 话题 y 轴镜像补偿：2026-09-29 yaw 标定（yaw_calib.csv）发现该系统
+        # /h_marker/position 的 y 与标准相机光轴系反号（视觉管线的符号问题，
+        # 根治应修视觉节点；此处做补偿）
+        self.declare_parameter("marker_flip_y", True)
+        self._flip_y = -1.0 if self.get_parameter("marker_flip_y").value else 1.0
+        # 控制器选择："rl"（策略网络）/ "p"（比例控制 baseline）/ "fixed"（固定机体系速度，
+        # 仅用于测试输出坐标映射：恒定机体系速度的 ENU 输出应以 1:1 斜率随 yaw 旋转）
+        self.declare_parameter("controller", "rl")
+        self.controller = self.get_parameter("controller").value
+        # P 控制器参数
+        self.declare_parameter("kp_xy", 0.3)          # 水平比例增益 (1/s)
+        self.declare_parameter("p_descent_vel", 0.3)  # 对准后的下降速度 (m/s)
+        self.declare_parameter("p_align_radius", 0.5)  # 水平偏差小于该值才下降 (m)
+        self.declare_parameter("p_min_alt", 0.3)      # 低于该高度停止下降 (m)
+        # fixed 模式参数：恒定的机体系速度指令 [右, 前, 下]
+        self.declare_parameter("fixed_v_right", 0.5)
+        self.declare_parameter("fixed_v_forward", 0.0)
+        self.declare_parameter("fixed_v_down", 0.0)
+        # 默认仅 GUIDED/QGUIDED 且解锁时发布；测试时可关闭（关闭后非引导模式也发布）
+        self.declare_parameter("require_guided", True)
 
         model_path = self.get_parameter("model_path").value
         self.policy = None
@@ -65,7 +85,10 @@ class LandingRLNode(Node):
             self.policy = PPO.load(model_path)
             self.get_logger().info(f"已加载策略: {model_path}")
         else:
-            self.get_logger().warn("未提供 model_path，节点只转发安全零指令")
+            if self.controller == "p":
+                self.get_logger().info("P 比例控制模式，无需模型")
+            else:
+                self.get_logger().warn("未提供 model_path，节点只转发安全零指令")
 
         # 观测归一化统计量（与训练时 VecNormalize 一致），不加载则直接用原始观测。
         # 优先用 .npz（export_vecnormalize.py 导出，跨 numpy 版本可用）；
@@ -84,10 +107,11 @@ class LandingRLNode(Node):
 
         self.p_cam: np.ndarray | None = None
         self.marker_stamp = None
-        self.vel_frd = np.zeros(3)      # 机体系 FRD: x前 y右 z下
+        self.vel_flu = np.zeros(3)      # 机体系 FLU: x前 y左 z上（阶跃数据实测，见 H2 假设验证）
         self.yaw = 0.0                  # ENU 航向（弧度，东为 0 逆时针为正）
         self.mav_state = State()
         self.prev_action = np.zeros(3, dtype=np.float32)
+        self._last_dbg_ns = 0
 
         self.create_subscription(Point, "/h_marker/position", self._marker_cb, 10)
         # MAVROS 遥测话题为 best_effort QoS，订阅方必须匹配
@@ -103,12 +127,13 @@ class LandingRLNode(Node):
 
     # -------------------------------------------------------------- #
     def _marker_cb(self, msg: Point):
-        self.p_cam = np.array([msg.x, msg.y, msg.z], dtype=np.float32)
+        # y 轴镜像补偿（话题 y 与标准相机光轴系反号），z 沿光轴不受影响
+        self.p_cam = np.array([msg.x, self._flip_y * msg.y, msg.z], dtype=np.float32)
         self.marker_stamp = self.get_clock().now()
 
     def _vel_cb(self, msg: TwistStamped):
         v = msg.twist.linear
-        self.vel_frd = np.array([v.x, v.y, v.z])
+        self.vel_flu = np.array([v.x, v.y, v.z])
 
     def _pose_cb(self, msg: PoseStamped):
         self.yaw = yaw_from_quaternion(msg.pose.orientation)
@@ -120,9 +145,10 @@ class LandingRLNode(Node):
     def _build_obs(self) -> np.ndarray:
         """组装与 LandingEnv 一致的 10 维观测：p_cam(3)+vel(3)+prev_action(3)+stale(1)。
 
-        训练环境的速度观测定义在 [右, 前, 下] 方向，即机体系 FRD 的 [y, x, z]。
+        训练环境的速度观测定义在 [右, 前, 下] 方向；
+        velocity_body 实测为 FLU [x前, y左, z上]，故 [右,前,下] = [-y, x, -z]。
         """
-        vel_env = np.array([self.vel_frd[1], self.vel_frd[0], self.vel_frd[2]])
+        vel_env = np.array([-self.vel_flu[1], self.vel_flu[0], -self.vel_flu[2]])
         obs = np.concatenate([self.p_cam, vel_env, self.prev_action, [0.0]]).astype(np.float32)
         if self.obs_norm is not None:
             mean, var, eps, clip = self.obs_norm
@@ -139,23 +165,64 @@ class LandingRLNode(Node):
     def _control_cb(self):
         cmd = Twist()
 
-        armed_guided = self.mav_state.armed and self.mav_state.mode in ("GUIDED", "QGUIDED")
+        require_guided = self.get_parameter("require_guided").value
+        armed_guided = (self.mav_state.armed
+                        and self.mav_state.mode in ("GUIDED", "QGUIDED")) or not require_guided
         marker_fresh = (
             self.p_cam is not None
             and self.marker_stamp is not None
             and (self.get_clock().now() - self.marker_stamp).nanoseconds * 1e-9
             < self.get_parameter("marker_timeout").value
         )
+        if self.controller == "fixed":
+            marker_fresh = True   # fixed 模式不需要视觉输入
 
-        if armed_guided and marker_fresh and (self.policy is not None or self.onnx_sess is not None):
-            action = np.clip(self._predict(self._build_obs()), -1.0, 1.0)
-            self.prev_action = action.astype(np.float32)
+        active = self.controller in ("p", "fixed") or (self.policy is not None or self.onnx_sess is not None)
+        if armed_guided and marker_fresh and active:
+            if self.controller == "fixed":
+                v_right = self.get_parameter("fixed_v_right").value
+                v_forward = self.get_parameter("fixed_v_forward").value
+                v_down = self.get_parameter("fixed_v_down").value
+            elif self.controller == "p":
+                # P 比例控制 baseline：p_cam 已补偿到 [右, 前(下视), 下] 约定，
+                # 水平速度正比于偏差；对准后才下降，低空停降
+                kp = self.get_parameter("kp_xy").value
+                v_right = kp * float(self.p_cam[0])
+                v_forward = kp * float(self.p_cam[1])
+                horiz_err = math.hypot(float(self.p_cam[0]), float(self.p_cam[1]))
+                alt = float(self.p_cam[2])
+                if horiz_err < self.get_parameter("p_align_radius").value \
+                        and alt > self.get_parameter("p_min_alt").value:
+                    v_down = self.get_parameter("p_descent_vel").value
+                else:
+                    v_down = 0.0
+            else:
+                obs = self._build_obs()
+                action = np.clip(self._predict(obs), -1.0, 1.0)
+                self.prev_action = action.astype(np.float32)
+                v_xy_max = self.get_parameter("v_xy_max").value
+                v_down_max = self.get_parameter("v_down_max").value
+                v_up_max = self.get_parameter("v_up_max").value
+                v_right = float(action[0]) * v_xy_max
+                v_forward = float(action[1]) * v_xy_max
+                v_down = (float(action[2]) + 1.0) / 2.0 * (v_down_max + v_up_max) - v_up_max
+                # 调试：每 2s 打印一次策略的输入输出，用于排查观测组装问题
+                if self.get_clock().now().nanoseconds - self._last_dbg_ns > 2e9:
+                    self._last_dbg_ns = self.get_clock().now().nanoseconds
+                    self.get_logger().info(
+                        f"[RL] p_cam=({self.p_cam[0]:+.2f},{self.p_cam[1]:+.2f},{self.p_cam[2]:+.2f}) "
+                        f"obs_vel=({obs[3]:+.2f},{obs[4]:+.2f},{obs[5]:+.2f}) "
+                        f"action=({action[0]:+.2f},{action[1]:+.2f},{action[2]:+.2f}) "
+                        f"obs_norm={'on' if self.obs_norm is not None else 'OFF!'}"
+                    )
+
+            # 限幅
             v_xy_max = self.get_parameter("v_xy_max").value
             v_down_max = self.get_parameter("v_down_max").value
             v_up_max = self.get_parameter("v_up_max").value
-            v_right = float(action[0]) * v_xy_max
-            v_forward = float(action[1]) * v_xy_max
-            v_down = (float(action[2]) + 1.0) / 2.0 * (v_down_max + v_up_max) - v_up_max
+            v_right = float(np.clip(v_right, -v_xy_max, v_xy_max))
+            v_forward = float(np.clip(v_forward, -v_xy_max, v_xy_max))
+            v_down = float(np.clip(v_down, -v_up_max, v_down_max))
 
             # 机体水平速度 -> ENU（实测 cmd_vel_unstamped 为世界固定 ENU 系）：
             # 机体前向 = (cosψ, sinψ)，机体右向 = (sinψ, -cosψ)

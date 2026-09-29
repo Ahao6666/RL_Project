@@ -71,17 +71,20 @@ docker exec ardupilot_image-v1.1.5 pip install onnxruntime
 
 ```bash
 docker exec ardupilot_image-v1.1.5 bash -c \
-  'source /home/insky/mavros_ws/install/setup.bash && python3 /tmp/landing_rl_node.py --ros-args \
-    -p model_path:=/tmp/ppo_landing_final.onnx \
-    -p vecnormalize_path:=/tmp/obs_norm.npz'
+  'source /home/insky/mavros_ws/install/setup.bash && python3 landing_rl_node.py --ros-args \
+    -p model_path:=ppo_landing_final.onnx \
+    -p vecnormalize_path:=obs_norm.npz'
 ```
 
 节点参数（均有默认值，可按需覆盖）：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
+| `controller` | `"rl"` | `"rl"` 策略网络 / `"p"` P 比例控制 baseline（无需模型，用于链路测试） |
+| `kp_xy` / `p_descent_vel` / `p_align_radius` / `p_min_alt` | `0.3` / `0.3` / `0.5` / `0.3` | P 控制：水平增益 (1/s)、下降速度、对准半径、停降高度 |
 | `model_path` | `""` | 策略路径，`.onnx`（推荐）或 SB3 `.zip`，不填则只发零速度 |
 | `vecnormalize_path` | `""` | 观测归一化 `.npz`（或训练同版本 numpy 下的 `.pkl`） |
+| `marker_flip_y` | `true` | 话题 y 轴镜像补偿（本系统 y 轴镜像，见 yaw 标定记录） |
 | `control_rate_hz` | `20.0` | 控制频率 |
 | `marker_timeout` | `0.5` | 视觉超时 (s)，超时发零速度悬停 |
 | `v_xy_max` / `v_down_max` / `v_up_max` | `2.0` / `1.5` / `0.8` | 速度限幅（须与训练一致） |
