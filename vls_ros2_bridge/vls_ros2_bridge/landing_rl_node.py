@@ -54,21 +54,32 @@ class LandingRLNode(Node):
 
         model_path = self.get_parameter("model_path").value
         self.policy = None
-        if model_path:
+        self.onnx_sess = None
+        if model_path.endswith(".onnx"):
+            # ONNX 推理（推荐）：部署环境只需 onnxruntime，不依赖 torch/sb3/numpy2
+            import onnxruntime as ort
+            self.onnx_sess = ort.InferenceSession(model_path)
+            self.get_logger().info(f"已加载 ONNX 策略: {model_path}")
+        elif model_path:
             from stable_baselines3 import PPO
             self.policy = PPO.load(model_path)
             self.get_logger().info(f"已加载策略: {model_path}")
         else:
             self.get_logger().warn("未提供 model_path，节点只转发安全零指令")
 
-        # 观测归一化统计量（与训练时 VecNormalize 一致），不加载则直接用原始观测
-        self.obs_rms = None
+        # 观测归一化统计量（与训练时 VecNormalize 一致），不加载则直接用原始观测。
+        # 优先用 .npz（export_vecnormalize.py 导出，跨 numpy 版本可用）；
+        # .pkl 仅在部署环境 numpy 版本与训练一致时可用。
+        self.obs_norm = None
         vn_path = self.get_parameter("vecnormalize_path").value
         if vn_path:
-            with open(vn_path, "rb") as f:
-                vn = pickle.load(f)
-            self.obs_rms = vn.obs_rms
-            self.obs_clip = vn.clip_obs
+            if vn_path.endswith(".npz"):
+                d = np.load(vn_path)
+                self.obs_norm = (d["mean"], d["var"], float(d["epsilon"]), float(d["clip_obs"]))
+            else:
+                with open(vn_path, "rb") as f:
+                    vn = pickle.load(f)
+                self.obs_norm = (vn.obs_rms.mean, vn.obs_rms.var, vn.epsilon, vn.clip_obs)
             self.get_logger().info(f"已加载观测归一化: {vn_path}")
 
         self.p_cam: np.ndarray | None = None
@@ -113,10 +124,17 @@ class LandingRLNode(Node):
         """
         vel_env = np.array([self.vel_frd[1], self.vel_frd[0], self.vel_frd[2]])
         obs = np.concatenate([self.p_cam, vel_env, self.prev_action, [0.0]]).astype(np.float32)
-        if self.obs_rms is not None:
-            obs = (obs - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + 1e-8)
-            obs = np.clip(obs, -self.obs_clip, self.obs_clip).astype(np.float32)
+        if self.obs_norm is not None:
+            mean, var, eps, clip = self.obs_norm
+            obs = (obs - mean) / np.sqrt(var + eps)
+            obs = np.clip(obs, -clip, clip).astype(np.float32)
         return obs
+
+    def _predict(self, obs: np.ndarray) -> np.ndarray:
+        if self.onnx_sess is not None:
+            return self.onnx_sess.run(None, {"obs": obs[None]})[0][0]
+        action, _ = self.policy.predict(obs, deterministic=True)
+        return action
 
     def _control_cb(self):
         cmd = Twist()
@@ -129,9 +147,8 @@ class LandingRLNode(Node):
             < self.get_parameter("marker_timeout").value
         )
 
-        if armed_guided and marker_fresh and self.policy is not None:
-            action, _ = self.policy.predict(self._build_obs(), deterministic=True)
-            action = np.clip(action, -1.0, 1.0)
+        if armed_guided and marker_fresh and (self.policy is not None or self.onnx_sess is not None):
+            action = np.clip(self._predict(self._build_obs()), -1.0, 1.0)
             self.prev_action = action.astype(np.float32)
             v_xy_max = self.get_parameter("v_xy_max").value
             v_down_max = self.get_parameter("v_down_max").value

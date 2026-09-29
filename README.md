@@ -44,16 +44,11 @@ python -m rl_vls.training.evaluate \
 
 ## 阶段 2 使用（ROS2 Humble）
 
-把 `vls_ros2_bridge` 拷入你的 ros2 工作空间 `src/` 下：
+SITL 闭环验证的完整部署流程（预检、容器准备、起飞就位、节点启动、安全措施）
+见 **[docs/SITL_DEPLOYMENT.md](docs/SITL_DEPLOYMENT.md)**。
 
-```bash
-colcon build --packages-select vls_ros2_bridge
-ros2 run vls_ros2_bridge landing_rl_node --ros-args \
-    -p model_path:=/abs/path/checkpoints/ppo_landing_final.zip
-```
-
-注意：桥接节点中的坐标系转换和 VecNormalize 对接处标有 TODO，
-需先在 SITL 上验证 `cmd_vel_unstamped` 的坐标系约定后再接入策略。
+桥接节点也可作为普通 ament_python 包使用：把 `vls_ros2_bridge` 拷入 ros2 工作空间
+`src/` 下 `colcon build` 后 `ros2 run vls_ros2_bridge landing_rl_node`。
 
 ## 环境关键参数（`LandingEnv`）
 
