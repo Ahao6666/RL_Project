@@ -70,10 +70,10 @@ docker exec ardupilot_image-v1.1.5 pip install onnxruntime
 ## 第 3 步：启动桥接节点
 
 ```bash
-docker exec ardupilot_image-v1.1.5 bash -c \
-  'source /home/insky/mavros_ws/install/setup.bash && python3 landing_rl_node.py --ros-args \
-    -p model_path:=ppo_landing_final.onnx \
-    -p vecnormalize_path:=obs_norm.npz'
+python3 landing_rl_node.py --ros-args \
+	-p model_path:=ppo_landing_final.onnx \  
+	-p vecnormalize_path:=obs_norm.npz \
+	-p controller:=hybrid
 ```
 
 节点参数（均有默认值，可按需覆盖）：
