@@ -1,112 +1,127 @@
-# SITL 闭环验证部署指南
+# SITL 视觉着陆使用指南
 
-将阶段 1 训练的 PPO 策略接入 docker 仿真（ArduPilot SITL + MAVROS + Gazebo）进行闭环降落验证。
+控制节点在宿主机运行，连接 ArduPilot SITL + MAVROS + Gazebo。
+当前复合翼使用 **GUIDED 控制、QLAND 降落**。以下命令均从项目根目录执行。
 
-- 策略模型：`checkpoints/ppo_landing_final.onnx`（由 `rl_vls/tools/export_onnx.py` 从
-  SB3 `.zip` 导出，容器内只需 `onnxruntime`，不依赖 torch/sb3/numpy2；
-  与 SB3 `predict(deterministic=True)` 输出误差 < 1e-6）
-- 观测归一化：`checkpoints/obs_norm.npz`（由 `rl_vls/tools/export_vecnormalize.py` 从 `vecnormalize.pkl` 导出，跨 numpy 版本可用）
-- 桥接节点：`vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py`
-  （`model_path` 以 `.onnx` 结尾走 onnxruntime，以 `.zip` 结尾走 SB3）
-
-前置实测结论（已反映在代码中）：
-
-| 项目 | 实测值 |
-| --- | --- |
-| `cmd_vel_unstamped` 坐标系 | 本地 ENU（世界固定系，z 向上为正） |
-| 水平速度响应 tau | ≈1.3 s |
-| 垂直速度响应 tau | ≈0.95 s |
-
----
-
-## 第 0 步：预检（仿真启动后先做）
+## 1. 准备环境
 
 ```bash
-# a. 确认 ardupilot 容器里能同时看到视觉与飞控两类话题
-docker exec ardupilot_image-v1.1.5 bash -c \
-  'source /home/insky/mavros_ws/install/setup.bash && ros2 topic list | grep -E "h_marker|mavros/state"'
-
-# b. 检查 /h_marker/position 的 QoS
-#    若 Reliability 为 BEST_EFFORT，需将桥接节点的订阅改为 qos_profile_sensor_data
-docker exec ardupilot_image-v1.1.5 bash -c \
-  'source /home/insky/mavros_ws/install/setup.bash && ros2 topic info /h_marker/position -v | head -20'
+source /opt/ros/humble/setup.bash
+# 若 mavros_msgs 安装在自己的工作空间，还需加载对应 install/setup.bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ```
 
-**故障排查**：若 a 中看不到 `/h_marker/position`，说明视觉容器与飞控容器之间 DDS 不通。
-检查两个容器的网络模式（`docker inspect <容器> | grep NetworkMode`）与 `ROS_DOMAIN_ID` 是否一致。
+Python 环境需要 ROS2 消息包及 NumPy；ONNX 模式额外需要 `onnxruntime`。
+如使用已有虚拟环境，执行 `source .venv/bin/activate`，并确认它可以导入 ROS2 包。
 
-## 第 1 步：准备容器环境
+宿主机与 MAVROS 统一使用 Fast DDS，避免出现话题可接收、服务无响应的问题。
+
+## 2. 检查通信
 
 ```bash
-# 拷入模型（ONNX）、归一化统计量、桥接节点
-docker cp checkpoints/ppo_landing_final.onnx ardupilot_image-v1.1.5:/tmp/
-docker cp checkpoints/obs_norm.npz ardupilot_image-v1.1.5:/tmp/
-docker cp vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py ardupilot_image-v1.1.5:/tmp/
-
-# 容器内安装推理依赖（仅 onnxruntime，体积小、无 ABI 风险）
-docker exec ardupilot_image-v1.1.5 pip install onnxruntime
+ros2 topic echo /h_marker/position --once
+ros2 topic echo /mavros/state --once
+ros2 topic echo /mavros/extended_state --once
+ros2 service type /mavros/set_mode
+ros2 service type /mavros/cmd/arming
 ```
 
-> 若模型有更新：宿主机重新导出
-> `.venv/bin/python rl_vls/tools/export_onnx.py checkpoints/ppo_landing_final.zip checkpoints/ppo_landing_final.onnx`
-> 再 `docker cp` 进容器即可。
+视觉消息类型为 `geometry_msgs/msg/PointStamped`。确认话题实际收到消息，
+速度指令能够送达 MAVROS，且模式切换和解除武装服务可用。
+若视觉发布端为 BEST_EFFORT，节点视觉订阅需使用匹配的 QoS。
 
-## 第 2 步：起飞就位
+## 3. 打开 Foxglove
 
-1. 手动控制无人机起飞，悬停在 H 靶标上方附近：
-   - 高度 **5~10 m**，水平偏差 **< 5 m**（需在训练分布内）
-2. 确认视觉话题持续输出：
-   ```bash
-   docker exec ardupilot_image-v1.1.5 bash -c \
-     'source /home/insky/mavros_ws/install/setup.bash && ros2 topic hz /h_marker/position'
-   ```
-3. 切换到 `GUIDED` 模式（垂起固定翼用 `QGUIDED`）：
-   ```bash
-   docker exec ardupilot_image-v1.1.5 bash -c \
-     'source /home/insky/mavros_ws/install/setup.bash && \
-      ros2 service call /mavros/set_mode mavros_msgs/srv/SetMode "{custom_mode: QGUIDED}"'
-   ```
-
-## 第 3 步：启动桥接节点
+首次安装：
 
 ```bash
-python3 landing_rl_node.py --ros-args \
-	-p model_path:=ppo_landing_final.onnx \  
-	-p vecnormalize_path:=obs_norm.npz \
-	-p controller:=hybrid
+sudo apt install ros-$ROS_DISTRO-foxglove-bridge
 ```
 
-节点参数（均有默认值，可按需覆盖）：
+在独立终端中加载 ROS2 环境，启动桥接并保持运行：
 
-| 参数 | 默认值 | 说明 |
+```bash
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765
+```
+
+打开 [Foxglove 仪表板](https://app.foxglove.dev/ahao/dashboard)。
+
+## 4. 起飞并切换模式
+
+手动起飞，在 H 靶标附近悬停，建议高度 **5～10 m**，确保目标持续可见。
+随后切换 GUIDED：
+
+```bash
+ros2 service call /mavros/set_mode mavros_msgs/srv/SetMode \
+  "{base_mode: 0, custom_mode: 'GUIDED'}"
+```
+
+## 5. 选择控制策略
+
+每次只运行一个控制节点；切换策略前先停止旧节点。
+
+| 策略 | `controller` | 说明 |
 | --- | --- | --- |
-| `controller` | `"rl"` | `"rl"` 策略网络 / `"p"` P 比例控制 baseline（无需模型，用于链路测试） |
-| `kp_xy` / `p_descent_vel` / `p_align_radius` / `p_min_alt` | `0.3` / `0.3` / `0.5` / `0.3` | P 控制：水平增益 (1/s)、下降速度、对准半径、停降高度 |
-| `model_path` | `""` | 策略路径，`.onnx`（推荐）或 SB3 `.zip`，不填则只发零速度 |
-| `vecnormalize_path` | `""` | 观测归一化 `.npz`（或训练同版本 numpy 下的 `.pkl`） |
-| `marker_flip_y` | `true` | 话题 y 轴镜像补偿（本系统 y 轴镜像，见 yaw 标定记录） |
-| `control_rate_hz` | `20.0` | 控制频率 |
-| `marker_timeout` | `0.5` | 视觉超时 (s)，超时发零速度悬停 |
-| `v_xy_max` / `v_down_max` / `v_up_max` | `2.0` / `1.5` / `0.8` | 速度限幅（须与训练一致） |
+| PPO | `rl` | 强化学习策略，需要模型和归一化文件 |
+| 混合控制 | `hybrid` | 高空 PPO，低于 3 m 切换 P 控制 |
+| P 控制 | `p` | 比例控制，无需模型 |
+| MPC | `mpc` | 模型预测控制，无需模型，内置滤波和指令平滑 |
 
-节点安全逻辑（无需人工干预）：
+### PPO / 混合控制
 
-- 仅当 **已解锁 + GUIDED/QGUIDED 模式 + 视觉消息新鲜（< 0.5 s）** 三个条件同时满足时才发布策略指令
-- 任一条件不满足即发布零速度（悬停）
+```bash
+python3 vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py --ros-args \
+  -p controller:=hybrid \
+  -p model_path:=checkpoints/ppo_landing_final.onnx \
+  -p vecnormalize_path:=checkpoints/obs_norm.npz \
+  -p v_xy_max:=2.0 -p v_down_max:=1.5 -p v_up_max:=0.8
+```
 
-## 安全措施
+纯 PPO 将 `hybrid` 改为 `rl`。模型 `.onnx` 与外部权重 `.onnx.data` 应放在同一目录，
+归一化文件须与模型匹配。
 
-- 遥控器/地面站随时准备切回 `QLOITER` 接管
-- 首次试飞在 **10 m 以上高度** 启动节点，观察是否朝靶标收敛，异常立即切走
-- 策略触地速度训练均值 ~0.4 m/s，仿真可接受；上真机前需进一步压低
+### P 控制
 
-## 验证记录模板
+```bash
+python3 vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py --ros-args \
+  -p controller:=p
+```
 
-试飞后记录以下信息便于后续迭代：
+### MPC
 
-- [ ] 启动高度 / 水平偏差
-- [ ] 是否收敛到靶标中心（着陆水平偏差）
-- [ ] 下降节奏（匀速/阶梯/振荡）
-- [ ] 触地速度
-- [ ] 是否出现视觉丢失悬停
-- [ ] 异常现象与接管时刻
+```bash
+python3 vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py --ros-args \
+  -p controller:=mpc
+```
+
+节点默认速度限幅为水平 **1.0 m/s**、下降/上升 **0.8 m/s**。
+上面的 PPO 命令使用训练时限幅；对比实验应为所有策略统一设置速度限幅。
+
+## 6. 自动降落与解除武装
+
+所有控制模式默认共用以下流程：
+
+1. 视觉高度低于 **2.0 m** 时请求 **QLAND**，在约 1.5 m 的识别下限前交给飞控。
+2. 等待模式确认期间输出零速度；确认后停止发布速度指令，由飞控完成降落。
+3. 飞控持续确认 `ON_GROUND` **1 秒**后，请求解除武装。
+
+进入流程后不再依赖 H 标识别。服务失败会重试；人工切换模式会取消自动流程。
+缺少落地遥测时不会仅凭高度解除武装。
+
+| 常用参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `auto_land_altitude` | `2.0` | 自动降落交接高度，m |
+| `auto_land_mode` | `QLAND` | 当前复合翼降落模式；四旋翼改用 `LAND` |
+| `auto_land_enabled` | `true` | 是否自动进入降落流程 |
+| `marker_timeout` | `1.0` | 视觉超时阈值，s |
+| `mpc_max_accel_xy` / `mpc_max_accel_z` | `0.8` / `0.4` | MPC 指令变化率上限，m/s² |
+
+高度指姿态补偿后的相机到靶标平面的距离，按相机安装位置调整交接高度。
+更多参数见 [README](../README.md)。
+
+## 7. 观察与记录
+
+随时准备切换 **QLOITER** 接管。观察目标是否收敛、速度指令是否振荡，以及
+是否依次出现 QLAND 模式确认和解除武装日志。
+
+每次测试记录：**初始高度/偏差、使用策略、最终落点偏差、振荡或丢失目标情况、接管原因**。

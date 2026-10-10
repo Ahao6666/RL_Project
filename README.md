@@ -44,7 +44,10 @@ python -m rl_vls.training.evaluate \
 
 ## 阶段 2 使用（ROS2 Humble）
 
-SITL 闭环验证的完整部署流程（预检、容器准备、起飞就位、节点启动、安全措施）
+控制节点可以直接在宿主机运行，只需配置 ROS2/Python 依赖，并确保话题收发及
+MAVROS 服务通信正常。
+
+SITL 闭环验证的完整部署流程（预检、运行环境、起飞就位、节点启动）
 见 **[docs/SITL_DEPLOYMENT.md](docs/SITL_DEPLOYMENT.md)**。
 
 桥接节点也可作为普通 ament_python 包使用：把 `vls_ros2_bridge` 拷入 ros2 工作空间

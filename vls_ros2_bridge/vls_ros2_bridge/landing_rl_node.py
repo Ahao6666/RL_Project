@@ -3,7 +3,7 @@
 数据流：
     /mavros/local_position/velocity_body (TwistStamped, 实测为 FLU 系) ─┐
     /mavros/local_position/pose (PoseStamped, 取 yaw)                  ├─> 观测组装 -> PPO
-    /h_marker/position (Point, 相机光轴系 z前/x右/y下)                  ─┘
+    /h_marker/position (PointStamped, 相机光轴系 z前/x右/y下)           ─┘
     PPO 动作 [v_right, v_forward, v_down]
         -> 按 yaw 旋转到 ENU -> /mavros/setpoint_velocity/cmd_vel_unstamped
 
@@ -20,7 +20,8 @@
 安全逻辑：
     - 仅在 GUIDED 模式且已解锁时发布策略指令；
     - 视觉消息超时 -> 发布零速度（悬停）；
-    - 所有指令做限幅。
+    - 所有指令做限幅；
+    - 所有控制器在高度 <2.0m 时交给 QLAND（默认），飞控确认落地后解除武装。
 """
 from __future__ import annotations
 
@@ -31,10 +32,18 @@ from collections import deque
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
-from mavros_msgs.msg import State
+from mavros_msgs.msg import ExtendedState, State
+from mavros_msgs.srv import CommandBool, SetMode
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
+
+try:
+    from .mpc_controller import LandingMPC
+    from .landing_sequence import LandingSequence
+except ImportError:  # direct script deployment
+    from mpc_controller import LandingMPC
+    from landing_sequence import LandingSequence
 
 
 def yaw_from_quaternion(q) -> float:
@@ -49,6 +58,14 @@ class LandingRLNode(Node):
         self.declare_parameter("model_path", "")
         self.declare_parameter("vecnormalize_path", "")
         self.declare_parameter("control_rate_hz", 20.0)
+        self.declare_parameter("auto_land_enabled", True)
+        self.declare_parameter("auto_land_altitude", 2.0)  # 自动降落触发高度 (m)
+        self.declare_parameter("auto_land_mode", "QLAND")
+        self.declare_parameter("landing_retry_s", 1.0)
+        self.declare_parameter("landing_request_timeout_s", 3.0)
+        self.declare_parameter("landing_state_timeout_s", 2.0)
+        self.declare_parameter("landed_state_timeout_s", 1.5)
+        self.declare_parameter("disarm_ground_hold_s", 1.0)
         self.declare_parameter("marker_timeout", 1.0)   # 视觉超时 (s) -> 悬停
         # 注：新鲜度按消息 header 时间戳判定（含检测延迟），故需大于检测管线延迟
         self.declare_parameter("v_xy_max", 1.0)
@@ -59,11 +76,41 @@ class LandingRLNode(Node):
         # 根治应修视觉节点；此处做补偿）
         self.declare_parameter("marker_flip_y", True)
         self._flip_y = -1.0 if self.get_parameter("marker_flip_y").value else 1.0
-        # 控制器选择："rl"（策略网络）/ "p"（比例控制 baseline）/ "hybrid"
+        # 控制器选择："mpc"（模型预测控制）/ "rl"（策略网络）/ "p" / "hybrid"
         # （高空 RL 接近 + 低空 P 降落，hybrid_alt 为切换高度）/ "fixed"（固定机体系速度，
         # 仅用于测试输出坐标映射：恒定机体系速度的 ENU 输出应以 1:1 斜率随 yaw 旋转）
         self.declare_parameter("controller", "rl")
         self.controller = self.get_parameter("controller").value
+        if self.controller not in ("rl", "p", "hybrid", "fixed", "mpc"):
+            raise ValueError("Unknown controller: " + self.controller)
+        for name, default in (("mpc_horizon", 40), ("mpc_tau_xy", 1.3),
+                              ("mpc_tau_z", 0.95), ("mpc_descent_speed", 0.8),
+                              ("mpc_align_radius", 0.3), ("mpc_iterations", 80),
+                              ("mpc_max_accel_xy", 0.8), ("mpc_max_accel_z", 0.4),
+                              ("mpc_position_filter_tau", 0.25),
+                              ("mpc_velocity_filter_tau", 0.1),
+                              ("mpc_descent_filter_tau", 0.4),
+                              ("mpc_command_smooth_w", 4.0)):
+            self.declare_parameter(name, default)
+        self.mpc = None
+        if self.controller == "mpc":
+            self.mpc = LandingMPC(
+                dt=1.0 / self.get_parameter("control_rate_hz").value,
+                horizon=self.get_parameter("mpc_horizon").value,
+                tau_xy=self.get_parameter("mpc_tau_xy").value,
+                tau_z=self.get_parameter("mpc_tau_z").value,
+                v_xy_max=self.get_parameter("v_xy_max").value,
+                v_down_max=self.get_parameter("v_down_max").value,
+                v_up_max=self.get_parameter("v_up_max").value,
+                descent_speed=self.get_parameter("mpc_descent_speed").value,
+                align_radius=self.get_parameter("mpc_align_radius").value,
+                iterations=self.get_parameter("mpc_iterations").value,
+                max_accel_xy=self.get_parameter("mpc_max_accel_xy").value,
+                max_accel_z=self.get_parameter("mpc_max_accel_z").value,
+                position_filter_tau=self.get_parameter("mpc_position_filter_tau").value,
+                velocity_filter_tau=self.get_parameter("mpc_velocity_filter_tau").value,
+                descent_filter_tau=self.get_parameter("mpc_descent_filter_tau").value,
+                command_smooth_w=self.get_parameter("mpc_command_smooth_w").value)
         self.declare_parameter("hybrid_alt", 3.0)     # hybrid 模式 RL->P 切换高度 (m)
         # P 控制器参数
         self.declare_parameter("kp_xy", 0.3)          # 水平比例增益 (1/s)
@@ -105,8 +152,8 @@ class LandingRLNode(Node):
             self.policy = PPO.load(model_path)
             self.get_logger().info(f"已加载策略: {model_path}")
         else:
-            if self.controller == "p":
-                self.get_logger().info("P 比例控制模式，无需模型")
+            if self.controller in ("p", "mpc", "fixed"):
+                self.get_logger().info(f"{self.controller} 控制模式，无需策略模型")
             else:
                 self.get_logger().warn("未提供 model_path，节点只转发安全零指令")
 
@@ -132,6 +179,18 @@ class LandingRLNode(Node):
         # 姿态历史缓冲：反旋转时按视觉帧时间戳取同时刻姿态，消除延迟错位
         self.pose_hist: deque = deque(maxlen=400)
         self.mav_state = State()
+        self.state_stamp_ns = None
+        self.extended_state = ExtendedState()
+        self.extended_state_stamp_ns = None
+        self.land_client = self.create_client(SetMode, "/mavros/set_mode")
+        self.disarm_client = self.create_client(CommandBool, "/mavros/cmd/arming")
+        self.landing = LandingSequence(
+            self._request_land, self._request_disarm, self.get_logger(),
+            altitude=self.get_parameter("auto_land_altitude").value,
+            land_mode=self.get_parameter("auto_land_mode").value,
+            retry_s=self.get_parameter("landing_retry_s").value,
+            request_timeout_s=self.get_parameter("landing_request_timeout_s").value,
+            disarm_hold_s=self.get_parameter("disarm_ground_hold_s").value)
         self.prev_action = np.zeros(3, dtype=np.float32)
         self._last_dbg_ns = 0
 
@@ -141,7 +200,9 @@ class LandingRLNode(Node):
                                  self._vel_cb, qos_profile_sensor_data)
         self.create_subscription(PoseStamped, "/mavros/local_position/pose",
                                  self._pose_cb, qos_profile_sensor_data)
-        self.create_subscription(State, "/mavros/state", self._state_cb, 10)
+        self.create_subscription(State, "/mavros/state", self._state_cb, qos_profile_sensor_data)
+        self.create_subscription(ExtendedState, "/mavros/extended_state",
+                                 self._extended_state_cb, qos_profile_sensor_data)
         self.cmd_pub = self.create_publisher(Twist, "/mavros/setpoint_velocity/cmd_vel_unstamped", 10)
 
         period = 1.0 / self.get_parameter("control_rate_hz").value
@@ -211,6 +272,40 @@ class LandingRLNode(Node):
 
     def _state_cb(self, msg: State):
         self.mav_state = msg
+        self.state_stamp_ns = self.get_clock().now().nanoseconds
+
+    def _extended_state_cb(self, msg: ExtendedState):
+        self.extended_state = msg
+        self.extended_state_stamp_ns = self.get_clock().now().nanoseconds
+
+    def _request_land(self, mode):
+        if not self.land_client.service_is_ready():
+            return None
+        request = SetMode.Request()
+        request.custom_mode = mode
+        return self.land_client.call_async(request)
+
+    def _request_disarm(self):
+        if not self.disarm_client.service_is_ready():
+            return None
+        request = CommandBool.Request()
+        request.value = False
+        return self.disarm_client.call_async(request)
+
+    def _landing_step(self, now_ns, marker_fresh):
+        def fresh(stamp, timeout):
+            return stamp is not None and 0 <= (now_ns - stamp)*1e-9 < timeout
+        return self.landing.update(
+            now_ns*1e-9, armed=self.mav_state.armed, mode=self.mav_state.mode,
+            state_fresh=self.mav_state.connected and fresh(
+                self.state_stamp_ns, self.get_parameter("landing_state_timeout_s").value),
+            marker_altitude=float(self.p_cam[2]) if self.p_cam is not None else None,
+            marker_fresh=marker_fresh,
+            on_ground=self.extended_state.landed_state == ExtendedState.LANDED_STATE_ON_GROUND,
+            ground_fresh=fresh(self.extended_state_stamp_ns,
+                               self.get_parameter("landed_state_timeout_s").value),
+            ground_stamp=self.extended_state_stamp_ns*1e-9
+                if self.extended_state_stamp_ns is not None else None)
 
     # -------------------------------------------------------------- #
     def _build_obs(self) -> np.ndarray:
@@ -236,20 +331,37 @@ class LandingRLNode(Node):
     def _control_cb(self):
         cmd = Twist()
 
+        now_ns = self.get_clock().now().nanoseconds
         require_guided = self.get_parameter("require_guided").value
         armed_guided = (self.mav_state.armed
                         and self.mav_state.mode in ("GUIDED", "QGUIDED")) or not require_guided
         marker_fresh = (
             self.p_cam is not None
             and self.marker_stamp_ns is not None
-            and (self.get_clock().now().nanoseconds - self.marker_stamp_ns) * 1e-9
+            and np.all(np.isfinite(self.p_cam))
+            and 0 <= (now_ns - self.marker_stamp_ns) * 1e-9
             < self.get_parameter("marker_timeout").value
         )
+        # Run before every controller, including fixed test mode. The handoff
+        # always requires real fresh vision and armed GUIDED/QGUIDED telemetry.
+        if (self.get_parameter("auto_land_enabled").value or self.landing.phase != "idle") \
+                and self._landing_step(now_ns, marker_fresh):
+            self._v_filt = np.zeros(3)
+            self.prev_action = np.zeros(3, dtype=np.float32)
+            if self.mpc is not None:
+                self.mpc.reset()
+            # While awaiting LAND confirmation, hold zero velocity. Once LAND
+            # owns control, stop publishing setpoints entirely; likewise on
+            # manual takeover or completion.
+            if self.landing.phase == "landing" and self.landing.confirmed_at is None \
+                    and self.mav_state.mode in ("GUIDED", "QGUIDED"):
+                self.cmd_pub.publish(cmd)
+            return
         if self.controller == "fixed":
             marker_fresh = True   # fixed 模式不需要视觉输入
 
         policy_loaded = self.policy is not None or self.onnx_sess is not None
-        active = self.controller in ("p", "fixed") or policy_loaded
+        active = self.controller in ("p", "fixed", "mpc") or policy_loaded
         if armed_guided and marker_fresh and active:
             # 控制器模式解析：hybrid = 高空 RL + 低空 P（hybrid_alt 切换）
             mode = self.controller
@@ -260,6 +372,17 @@ class LandingRLNode(Node):
                 v_right = self.get_parameter("fixed_v_right").value
                 v_forward = self.get_parameter("fixed_v_forward").value
                 v_down = self.get_parameter("fixed_v_down").value
+            elif mode == "mpc":
+                velocity = np.array([-self.vel_flu[1], self.vel_flu[0], -self.vel_flu[2]])
+                v_right, v_forward, v_down = self.mpc.command(
+                    self.p_cam, velocity, measurement_stamp=self.marker_stamp_ns)
+                if now_ns - self._last_dbg_ns > 2e9:
+                    self._last_dbg_ns = now_ns
+                    estimate = self.mpc.filtered_position
+                    self.get_logger().info(
+                        f"[MPC] p_cam=({self.p_cam[0]:+.2f},{self.p_cam[1]:+.2f},{self.p_cam[2]:+.2f}) "
+                        f"estimate={estimate} cmd=({v_right:+.2f},{v_forward:+.2f},{v_down:+.2f}) "
+                        f"outliers={self._outlier_count}")
             elif mode == "p":
                 # P 比例控制 baseline：p_cam 已补偿到 [右, 前(下视), 下] 约定，
                 # 水平速度正比于偏差；对准后才下降，低空停降
@@ -309,7 +432,7 @@ class LandingRLNode(Node):
 
             # 指令低通滤波：抑制高频振荡分量（在限幅前对机体系速度滤波）
             alpha = self.get_parameter("cmd_filter_alpha").value
-            if alpha < 1.0:
+            if alpha < 1.0 and self.controller != "mpc":
                 self._v_filt = alpha * np.array([v_right, v_forward, v_down]) \
                     + (1.0 - alpha) * self._v_filt
                 v_right, v_forward, v_down = float(self._v_filt[0]), float(self._v_filt[1]), float(self._v_filt[2])
@@ -331,6 +454,8 @@ class LandingRLNode(Node):
         else:
             # 非激活状态：滤波器归零，下次激活从零速起步，避免旧值残存
             self._v_filt = np.zeros(3)
+            if self.mpc is not None:
+                self.mpc.reset()
             # 诊断：每 3s 打印一次未激活原因（此时没有 [RL] 日志，否则无法定位）
             if self.get_clock().now().nanoseconds - self._last_dbg_ns > 3e9:
                 self._last_dbg_ns = self.get_clock().now().nanoseconds
