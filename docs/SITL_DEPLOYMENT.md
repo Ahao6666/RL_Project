@@ -125,3 +125,26 @@ python3 vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py --ros-args \
 是否依次出现 QLAND 模式确认和解除武装日志。
 
 每次测试记录：**初始高度/偏差、使用策略、最终落点偏差、振荡或丢失目标情况、接管原因**。
+
+## 8. 飞行日志与分析
+
+节点默认按控制频率记录日志，启动时显示 CSV 路径，文件保存在 `runs/flight_logs/`。
+内容包括原始/补偿后的视觉目标位置、速度指令、实际速度、ENU 位置、姿态角、
+飞控模式和降落阶段；同名 JSON 保存本次参数及日志丢行信息。
+
+结束飞行后正常停止节点，再分析对应 CSV：
+
+```bash
+python3 -m rl_vls.tools.analyze_flight_log runs/flight_logs/实际日志名.csv
+```
+
+分析结果保存在同目录的 `日志名_analysis/`：`summary.json` 包含超调、稳定时间、
+速度跟踪误差和指令振荡统计；`flight.png` 包含位置、速度、姿态和阶段曲线。
+曲线需要 `matplotlib`；未安装时仍可生成统计报告。
+
+默认稳定条件为：水平误差 ≤0.3 m、水平实际速度 ≤0.2 m/s，连续至少 2 秒。
+策略控制与自主 QLAND 分开分析；最后视觉误差表示交接前偏差，并非触地偏差。
+缺失或过期的遥测不会用于判定稳定。
+
+可通过 `-p flight_log_dir:=其他目录` 修改保存位置，或
+`-p flight_log_enabled:=false` 关闭记录。更多分析选项见 `--help`。

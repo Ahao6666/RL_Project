@@ -41,9 +41,11 @@ from rclpy.time import Time
 try:
     from .mpc_controller import LandingMPC
     from .landing_sequence import LandingSequence
+    from .flight_logger import FlightLogger, VECTORS, quaternion_degrees
 except ImportError:  # direct script deployment
     from mpc_controller import LandingMPC
     from landing_sequence import LandingSequence
+    from flight_logger import FlightLogger, VECTORS, quaternion_degrees
 
 
 def yaw_from_quaternion(q) -> float:
@@ -58,6 +60,8 @@ class LandingRLNode(Node):
         self.declare_parameter("model_path", "")
         self.declare_parameter("vecnormalize_path", "")
         self.declare_parameter("control_rate_hz", 20.0)
+        self.declare_parameter("flight_log_enabled", True)
+        self.declare_parameter("flight_log_dir", "runs/flight_logs")
         self.declare_parameter("auto_land_enabled", True)
         self.declare_parameter("auto_land_altitude", 2.0)  # 自动降落触发高度 (m)
         self.declare_parameter("auto_land_mode", "QLAND")
@@ -172,6 +176,14 @@ class LandingRLNode(Node):
                 self.obs_norm = (vn.obs_rms.mean, vn.obs_rms.var, vn.epsilon, vn.clip_obs)
             self.get_logger().info(f"已加载观测归一化: {vn_path}")
 
+        self.marker_raw = None
+        self.marker_raw_stamp_ns = None
+        self.marker_status = "missing"
+        self.vel_stamp_ns = self.vel_enu_stamp_ns = self.pose_stamp_ns = None
+        self.vel_enu = np.full(3, np.nan)
+        self.pos_enu = np.full(3, np.nan)
+        self.flight_recorder = None
+        self._flight_log_error_reported = False
         self.p_cam: np.ndarray | None = None
         self.marker_stamp_ns: int | None = None   # 视觉帧时间戳（消息 header）
         self.vel_flu = np.zeros(3)      # 机体系 FLU: x前 y左 z上（阶跃数据实测，见 H2 假设验证）
@@ -198,6 +210,8 @@ class LandingRLNode(Node):
         # MAVROS 遥测话题为 best_effort QoS，订阅方必须匹配
         self.create_subscription(TwistStamped, "/mavros/local_position/velocity_body",
                                  self._vel_cb, qos_profile_sensor_data)
+        self.create_subscription(TwistStamped, "/mavros/local_position/velocity_local",
+                                 self._vel_enu_cb, qos_profile_sensor_data)
         self.create_subscription(PoseStamped, "/mavros/local_position/pose",
                                  self._pose_cb, qos_profile_sensor_data)
         self.create_subscription(State, "/mavros/state", self._state_cb, qos_profile_sensor_data)
@@ -205,6 +219,14 @@ class LandingRLNode(Node):
                                  self._extended_state_cb, qos_profile_sensor_data)
         self.cmd_pub = self.create_publisher(Twist, "/mavros/setpoint_velocity/cmd_vel_unstamped", 10)
 
+        if self.get_parameter("flight_log_enabled").value:
+            try:
+                self.flight_recorder = FlightLogger(
+                    self.get_parameter("flight_log_dir").value, self.controller,
+                    {name: parameter.value for name, parameter in self._parameters.items()})
+                self.get_logger().info(f"飞行日志: {self.flight_recorder.path}")
+            except (OSError, ValueError) as exc:
+                self.get_logger().error(f"无法创建飞行日志，继续控制: {exc}")
         period = 1.0 / self.get_parameter("control_rate_hz").value
         self.create_timer(period, self._control_cb)
 
@@ -240,6 +262,11 @@ class LandingRLNode(Node):
         now_ns = self.get_clock().now().nanoseconds
         if stamp_ns <= 0 or abs(now_ns - stamp_ns) > 10e9:
             stamp_ns = now_ns
+        self.marker_raw = np.array([msg.point.x, msg.point.y, msg.point.z])
+        self.marker_raw_stamp_ns = stamp_ns
+        if not np.all(np.isfinite(self.marker_raw)):
+            self.marker_status = "invalid"
+            return
         # y 轴镜像补偿（话题 y 与标准相机光轴系反号），z 沿光轴不受影响
         new_p = np.array([msg.point.x, self._flip_y * msg.point.y, msg.point.z],
                          dtype=np.float64)
@@ -253,15 +280,26 @@ class LandingRLNode(Node):
                 + self.get_parameter("marker_max_step_per_m").value * abs(float(new_p[2]))
             if np.linalg.norm(new_p - self.p_cam) > allowed:
                 self._outlier_count += 1
+                self.marker_status = "outlier"
                 return
+        self.marker_status = "accepted"
         self.p_cam = new_p.astype(np.float32)
         self.marker_stamp_ns = stamp_ns
 
     def _vel_cb(self, msg: TwistStamped):
         v = msg.twist.linear
         self.vel_flu = np.array([v.x, v.y, v.z])
+        self.vel_stamp_ns = self.get_clock().now().nanoseconds
+
+    def _vel_enu_cb(self, msg: TwistStamped):
+        v = msg.twist.linear
+        self.vel_enu = np.array([v.x, v.y, v.z])
+        self.vel_enu_stamp_ns = self.get_clock().now().nanoseconds
 
     def _pose_cb(self, msg: PoseStamped):
+        position = msg.pose.position
+        self.pos_enu = np.array([position.x, position.y, position.z])
+        self.pose_stamp_ns = self.get_clock().now().nanoseconds
         q = msg.pose.orientation
         self.quat = (q.w, q.x, q.y, q.z)
         self.yaw = yaw_from_quaternion(q)
@@ -330,6 +368,7 @@ class LandingRLNode(Node):
 
     def _control_cb(self):
         cmd = Twist()
+        effective_controller = "idle"
 
         now_ns = self.get_clock().now().nanoseconds
         require_guided = self.get_parameter("require_guided").value
@@ -342,6 +381,7 @@ class LandingRLNode(Node):
             and 0 <= (now_ns - self.marker_stamp_ns) * 1e-9
             < self.get_parameter("marker_timeout").value
         )
+        visual_fresh = marker_fresh
         # Run before every controller, including fixed test mode. The handoff
         # always requires real fresh vision and armed GUIDED/QGUIDED telemetry.
         if (self.get_parameter("auto_land_enabled").value or self.landing.phase != "idle") \
@@ -356,6 +396,9 @@ class LandingRLNode(Node):
             if self.landing.phase == "landing" and self.landing.confirmed_at is None \
                     and self.mav_state.mode in ("GUIDED", "QGUIDED"):
                 self.cmd_pub.publish(cmd)
+                self._record_flight_sample(now_ns, cmd, self.landing.phase, visual_fresh)
+            else:
+                self._record_flight_sample(now_ns, None, self.landing.phase, visual_fresh)
             return
         if self.controller == "fixed":
             marker_fresh = True   # fixed 模式不需要视觉输入
@@ -368,6 +411,7 @@ class LandingRLNode(Node):
             if mode == "hybrid":
                 hybrid_alt = self.get_parameter("hybrid_alt").value
                 mode = "rl" if float(self.p_cam[2]) > hybrid_alt else "p"
+            effective_controller = mode
             if mode == "fixed":
                 v_right = self.get_parameter("fixed_v_right").value
                 v_forward = self.get_parameter("fixed_v_forward").value
@@ -471,6 +515,47 @@ class LandingRLNode(Node):
                 )
 
         self.cmd_pub.publish(cmd)
+        self._record_flight_sample(now_ns, cmd, effective_controller, visual_fresh)
+
+    def _record_flight_sample(self, now_ns, cmd, phase, marker_fresh):
+        recorder = self.flight_recorder
+        if recorder is None:
+            return
+        if recorder.error is not None:
+            if not self._flight_log_error_reported:
+                self.get_logger().error(f"飞行日志写入失败，继续控制: {recorder.error}")
+                self._flight_log_error_reported = True
+            return
+        def age(stamp):
+            return (now_ns-stamp)*1e-9 if stamp is not None else float('nan')
+        cmd_enu = np.array([cmd.linear.x, cmd.linear.y, cmd.linear.z]) if cmd else np.full(3, np.nan)
+        c, sine = math.cos(self.yaw), math.sin(self.yaw)
+        cmd_body = [cmd_enu[0]*sine-cmd_enu[1]*c,
+                    cmd_enu[0]*c+cmd_enu[1]*sine, -cmd_enu[2]]
+        row = dict(controller=self.controller, phase=phase, mode=self.mav_state.mode,
+                   armed=int(self.mav_state.armed), connected=int(self.mav_state.connected),
+                   landed_state=self.extended_state.landed_state,
+                   cmd_published=int(cmd is not None), marker_fresh=int(marker_fresh),
+                   marker_status=self.marker_status, outlier_count=self._outlier_count,
+                   marker_stamp_ns=self.marker_stamp_ns, marker_raw_stamp_ns=self.marker_raw_stamp_ns,
+                   marker_age_s=age(self.marker_stamp_ns), vel_age_s=age(self.vel_stamp_ns),
+                   vel_enu_age_s=age(self.vel_enu_stamp_ns), pose_age_s=age(self.pose_stamp_ns),
+                   state_age_s=age(self.state_stamp_ns), landed_age_s=age(self.extended_state_stamp_ns))
+        vectors = dict(marker_raw=self.marker_raw, marker=self.p_cam, cmd_enu=cmd_enu,
+                       cmd_body=cmd_body, vel_flu=self.vel_flu if self.vel_stamp_ns is not None else None,
+                       vel_enu=self.vel_enu, pos_enu=self.pos_enu,
+                       attitude=quaternion_degrees(self.quat) if self.pose_stamp_ns is not None else None,
+                       quat=self.quat if self.pose_stamp_ns is not None else None)
+        for prefix, axes in VECTORS.items():
+            values = vectors[prefix]
+            if values is not None:
+                row.update({f"{prefix}_{axis}": float(value) for axis, value in zip(axes, values)})
+        recorder.record(now_ns, row)
+
+    def destroy_node(self):
+        if self.flight_recorder is not None:
+            self.flight_recorder.close()
+        return super().destroy_node()
 
 
 def main():

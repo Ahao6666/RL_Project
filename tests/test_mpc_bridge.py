@@ -26,7 +26,8 @@ class MPCBridgeTest(unittest.TestCase):
             _last_dbg_ns=0, _v_filt=np.zeros(3),
             get_parameter=lambda name: SimpleNamespace(value=params[name]),
             get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=0)),
-            cmd_pub=SimpleNamespace(publish=published.append))
+            cmd_pub=SimpleNamespace(publish=published.append),
+                    _record_flight_sample=lambda *args: None)
         LandingRLNode._control_cb(node)
         # At yaw=90 degrees, right is east. MPC bypasses the 0.25 filter.
         self.assertGreater(published[-1].linear.x, 0.)

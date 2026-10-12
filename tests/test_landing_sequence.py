@@ -176,7 +176,8 @@ class SequenceTest(unittest.TestCase):
                     prev_action=np.ones(3),
                     get_parameter=lambda name: SimpleNamespace(value=params[name]),
                     get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=clock[0])),
-                    cmd_pub=SimpleNamespace(publish=published.append))
+                    cmd_pub=SimpleNamespace(publish=published.append),
+                    _record_flight_sample=lambda *args: None)
                 node._landing_step = MethodType(LandingRLNode._landing_step, node)
                 LandingRLNode._control_cb(node)
                 self.assertEqual(self.calls, [('land', 'LAND')])
