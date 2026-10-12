@@ -87,14 +87,17 @@ class LandingRLNode(Node):
         self.controller = self.get_parameter("controller").value
         if self.controller not in ("rl", "p", "hybrid", "fixed", "mpc"):
             raise ValueError("Unknown controller: " + self.controller)
-        for name, default in (("mpc_horizon", 40), ("mpc_tau_xy", 1.3),
-                              ("mpc_tau_z", 0.95), ("mpc_descent_speed", 0.8),
-                              ("mpc_align_radius", 0.3), ("mpc_iterations", 80),
-                              ("mpc_max_accel_xy", 0.8), ("mpc_max_accel_z", 0.4),
+        for name, default in (("mpc_horizon", 60), ("mpc_tau_xy", 0.6),
+                              ("mpc_tau_z", 0.4), ("mpc_descent_speed", 0.3),
+                              ("mpc_align_radius", 0.5), ("mpc_iterations", 80),
+                              ("mpc_max_accel_xy", 0.4), ("mpc_max_accel_z", 0.4),
                               ("mpc_position_filter_tau", 0.25),
                               ("mpc_velocity_filter_tau", 0.1),
                               ("mpc_descent_filter_tau", 0.4),
-                              ("mpc_command_smooth_w", 4.0)):
+                              ("mpc_command_smooth_w", 4.0), ("mpc_delay_xy", 0.3),
+                              ("mpc_delay_z", 0.15), ("mpc_visual_scale", 0.73),
+                              ("mpc_align_speed", 0.2), ("mpc_position_weight_xy", 2.0),
+                              ("mpc_velocity_weight_xy", 4.0)):
             self.declare_parameter(name, default)
         self.mpc = None
         if self.controller == "mpc":
@@ -114,7 +117,13 @@ class LandingRLNode(Node):
                 position_filter_tau=self.get_parameter("mpc_position_filter_tau").value,
                 velocity_filter_tau=self.get_parameter("mpc_velocity_filter_tau").value,
                 descent_filter_tau=self.get_parameter("mpc_descent_filter_tau").value,
-                command_smooth_w=self.get_parameter("mpc_command_smooth_w").value)
+                command_smooth_w=self.get_parameter("mpc_command_smooth_w").value,
+                delay_xy=self.get_parameter("mpc_delay_xy").value,
+                delay_z=self.get_parameter("mpc_delay_z").value,
+                visual_scale=self.get_parameter("mpc_visual_scale").value,
+                align_speed=self.get_parameter("mpc_align_speed").value,
+                position_weight_xy=self.get_parameter("mpc_position_weight_xy").value,
+                velocity_weight_xy=self.get_parameter("mpc_velocity_weight_xy").value)
         self.declare_parameter("hybrid_alt", 3.0)     # hybrid 模式 RL->P 切换高度 (m)
         # P 控制器参数
         self.declare_parameter("kp_xy", 0.3)          # 水平比例增益 (1/s)
@@ -418,6 +427,14 @@ class LandingRLNode(Node):
                 v_down = self.get_parameter("fixed_v_down").value
             elif mode == "mpc":
                 velocity = np.array([-self.vel_flu[1], self.vel_flu[0], -self.vel_flu[2]])
+                # Match the level camera observation with level ENU velocity.
+                if (self.vel_enu_stamp_ns is not None and self.pose_stamp_ns is not None
+                        and 0 <= (now_ns-self.vel_enu_stamp_ns)*1e-9 < 0.2
+                        and 0 <= (now_ns-self.pose_stamp_ns)*1e-9 < 0.2
+                        and np.all(np.isfinite(self.vel_enu))):
+                    c, sine = math.cos(self.yaw), math.sin(self.yaw)
+                    velocity = np.array([self.vel_enu[0]*sine-self.vel_enu[1]*c,
+                                         self.vel_enu[0]*c+self.vel_enu[1]*sine, -self.vel_enu[2]])
                 v_right, v_forward, v_down = self.mpc.command(
                     self.p_cam, velocity, measurement_stamp=self.marker_stamp_ns)
                 if now_ns - self._last_dbg_ns > 2e9:
@@ -425,7 +442,7 @@ class LandingRLNode(Node):
                     estimate = self.mpc.filtered_position
                     self.get_logger().info(
                         f"[MPC] p_cam=({self.p_cam[0]:+.2f},{self.p_cam[1]:+.2f},{self.p_cam[2]:+.2f}) "
-                        f"estimate={estimate} cmd=({v_right:+.2f},{v_forward:+.2f},{v_down:+.2f}) "
+                        f"estimate_m={estimate} descent_gate={self.mpc.descent_gate:.2f} cmd=({v_right:+.2f},{v_forward:+.2f},{v_down:+.2f}) "
                         f"outliers={self._outlier_count}")
             elif mode == "p":
                 # P 比例控制 baseline：p_cam 已补偿到 [右, 前(下视), 下] 约定，
@@ -541,7 +558,10 @@ class LandingRLNode(Node):
                    marker_age_s=age(self.marker_stamp_ns), vel_age_s=age(self.vel_stamp_ns),
                    vel_enu_age_s=age(self.vel_enu_stamp_ns), pose_age_s=age(self.pose_stamp_ns),
                    state_age_s=age(self.state_stamp_ns), landed_age_s=age(self.extended_state_stamp_ns))
-        vectors = dict(marker_raw=self.marker_raw, marker=self.p_cam, cmd_enu=cmd_enu,
+        row['mpc_descent_gate'] = self.mpc.descent_gate if self.mpc is not None else float('nan')
+        vectors = dict(mpc_position=self.mpc.filtered_position if self.mpc is not None else None,
+                       mpc_velocity=self.mpc.filtered_velocity if self.mpc is not None else None,
+                       marker_raw=self.marker_raw, marker=self.p_cam, cmd_enu=cmd_enu,
                        cmd_body=cmd_body, vel_flu=self.vel_flu if self.vel_stamp_ns is not None else None,
                        vel_enu=self.vel_enu, pos_enu=self.pos_enu,
                        attitude=quaternion_degrees(self.quat) if self.pose_stamp_ns is not None else None,

@@ -22,7 +22,7 @@ class MPCBridgeTest(unittest.TestCase):
             controller='mpc', landing=SimpleNamespace(phase='idle'), mpc=LandingMPC(), policy=None, onnx_sess=None,
             mav_state=SimpleNamespace(armed=True, mode='GUIDED'),
             p_cam=np.array([2., 0., 8.]), marker_stamp_ns=0,
-            vel_flu=np.zeros(3), yaw=math.pi/2,
+            vel_flu=np.zeros(3), vel_enu_stamp_ns=None, pose_stamp_ns=None, yaw=math.pi/2,
             _last_dbg_ns=0, _v_filt=np.zeros(3),
             get_parameter=lambda name: SimpleNamespace(value=params[name]),
             get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=0)),
@@ -33,6 +33,15 @@ class MPCBridgeTest(unittest.TestCase):
         self.assertGreater(published[-1].linear.x, 0.)
         self.assertAlmostEqual(published[-1].linear.x, node.mpc.previous[0])
         self.assertAlmostEqual(published[-1].linear.y, 0.)
+        # Fresh world velocity must be rotated to the same level frame as pc;
+        # body velocity includes roll/pitch and is only a fallback.
+        captured = []
+        original_command = node.mpc.command
+        node.mpc.command = lambda p, v, **kwargs: captured.append(v.copy()) or original_command(p, v, **kwargs)
+        node.vel_enu_stamp_ns = node.pose_stamp_ns = 0
+        node.vel_enu = np.array([0.1, 0.2, 0.3])
+        LandingRLNode._control_cb(node)
+        np.testing.assert_allclose(captured[-1], [0.1, 0.2, -0.3], atol=1e-12)
         node.mav_state.armed = False
         LandingRLNode._control_cb(node)
         self.assertEqual(published[-1].linear.x, 0.)

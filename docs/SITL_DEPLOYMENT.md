@@ -67,18 +67,16 @@ ros2 service call /mavros/set_mode mavros_msgs/srv/SetMode \
 | P 控制 | `p` | 比例控制，无需模型 |
 | MPC | `mpc` | 模型预测控制，无需模型，内置滤波和指令平滑 |
 
-### PPO / 混合控制
+### PPO 
 
 ```bash
 python3 vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py --ros-args \
-  -p controller:=hybrid \
+  -p controller:=rl \
   -p model_path:=checkpoints/ppo_landing_final.onnx \
-  -p vecnormalize_path:=checkpoints/obs_norm.npz \
-  -p v_xy_max:=2.0 -p v_down_max:=1.5 -p v_up_max:=0.8
+  -p vecnormalize_path:=checkpoints/obs_norm.npz
 ```
 
-纯 PPO 将 `hybrid` 改为 `rl`。模型 `.onnx` 与外部权重 `.onnx.data` 应放在同一目录，
-归一化文件须与模型匹配。
+模型 `.onnx` 与外部权重 `.onnx.data` 应放在同一目录，归一化文件须与模型匹配。
 
 ### P 控制
 
@@ -94,8 +92,23 @@ python3 vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py --ros-args \
   -p controller:=mpc
 ```
 
+MPC 当前默认下降速度为 **0.3 m/s**，水平对准且速度低于 **0.2 m/s** 后逐渐允许下降。
+预测模型包含延迟补偿；视觉尺度默认 `mpc_visual_scale=0.73`，按当前 SITL 日志估计，
+表示视觉位移约为实际位移的 0.73 倍。更换视觉标定后需重新校验；正确米制输入设为 1.0。
+
 节点默认速度限幅为水平 **1.0 m/s**、下降/上升 **0.8 m/s**。
 上面的 PPO 命令使用训练时限幅；对比实验应为所有策略统一设置速度限幅。
+
+### 混合控制（P+PPO）
+
+```bash
+python3 vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py --ros-args \
+  -p controller:=hybrid \
+  -p model_path:=checkpoints/ppo_landing_final.onnx \
+  -p vecnormalize_path:=checkpoints/obs_norm.npz
+```
+
+
 
 ## 6. 自动降落与解除武装
 
@@ -114,7 +127,7 @@ python3 vls_ros2_bridge/vls_ros2_bridge/landing_rl_node.py --ros-args \
 | `auto_land_mode` | `QLAND` | 当前复合翼降落模式；四旋翼改用 `LAND` |
 | `auto_land_enabled` | `true` | 是否自动进入降落流程 |
 | `marker_timeout` | `1.0` | 视觉超时阈值，s |
-| `mpc_max_accel_xy` / `mpc_max_accel_z` | `0.8` / `0.4` | MPC 指令变化率上限，m/s² |
+| `mpc_max_accel_xy` / `mpc_max_accel_z` | `0.4` / `0.4` | MPC 指令变化率上限，m/s² |
 
 高度指姿态补偿后的相机到靶标平面的距离，按相机安装位置调整交接高度。
 更多参数见 [README](../README.md)。
@@ -148,3 +161,13 @@ python3 -m rl_vls.tools.analyze_flight_log runs/flight_logs/实际日志名.csv
 
 可通过 `-p flight_log_dir:=其他目录` 修改保存位置，或
 `-p flight_log_enabled:=false` 关闭记录。更多分析选项见 `--help`。
+
+
+对比多次飞行：
+
+```bash
+python3 -m rl_vls.tools.compare_flight_logs
+```
+
+结果保存在 `runs/flight_logs/comparison/`，包括对比表、曲线以及视觉尺度/速度响应拟合。
+不同初始条件下的结果不能直接当作严格的策略排名。

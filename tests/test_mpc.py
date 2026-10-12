@@ -39,13 +39,39 @@ class MPCTest(unittest.TestCase):
         alpha = 0.1/(mpc.position_filter_tau+0.1)
         np.testing.assert_allclose(mpc.filtered_position, predicted+alpha*(p-predicted))
 
+    def test_delayed_prediction_uses_issued_command_queue(self):
+        mpc = LandingMPC(horizon=10, delay_xy=0.15, delay_z=0.1)
+        commands = np.linspace(-0.3, 0.4, mpc.horizon)
+        for axis, (F, G, _, _, _) in enumerate(mpc.models):
+            delay = mpc.delays[axis]
+            history = list(np.linspace(0.1, 0.2, delay))
+            predicted = F @ np.r_[2., 0.1, history] + G @ commands
+            p, v = 2., 0.1
+            tau = 0.4 if axis == 2 else 0.6
+            for k, command in enumerate(commands):
+                history.append(command)
+                applied = history.pop(0)
+                v += (applied-v)*mpc.dt/tau
+                p -= v*mpc.dt
+                np.testing.assert_allclose(predicted[2*k:2*k+2], [p, v], atol=1e-10)
+
+    def test_visual_calibration_and_speed_gate(self):
+        mpc = LandingMPC(visual_scale=0.73, velocity_filter_tau=0.)
+        mpc.command([0.073, 0., 5.11], [0., 0., 0.])
+        np.testing.assert_allclose(mpc.filtered_position, [0.1, 0., 7.])
+        self.assertGreater(mpc.descent_gate, 0.)
+        mpc.command([0.073, 0., 5.11], [0.3, 0., 0.])
+        self.assertEqual(mpc.descent_gate, 0.)
+        mpc.reset()
+        self.assertTrue(all(np.all(history == 0.) for history in mpc.command_history))
+
     def test_prediction_matches_environment(self):
         env = LandingEnv(tau_xy_range=(1.3, 1.3), tau_z_range=(0.95, 0.95),
                          noise_cfg=dict(dropout_prob=0.))
         env.reset(seed=4)
         env.pos = np.array([0.2, -0.1, 5.])
         env.vel = np.array([0.1, -0.2, 0.3])
-        mpc = LandingMPC()
+        mpc = LandingMPC(tau_xy=1.3, tau_z=0.95, delay_xy=0., delay_z=0.)
         commands = np.tile([0.4, -0.3, 0.2], (mpc.horizon, 1))
         initial_p, initial_v = env._true_p_cam(), env.vel.copy()
         predictions = []
@@ -67,11 +93,11 @@ class MPCTest(unittest.TestCase):
         np.testing.assert_allclose(a, mpc.command([0, 0, 4], [0, 0, 0]))
 
     def test_closed_loop_landing(self):
-        env = LandingEnv(tau_xy_range=(1.3, 1.3), tau_z_range=(0.95, 0.95),
+        env = LandingEnv(max_episode_time=120., tau_xy_range=(1.3, 1.3), tau_z_range=(0.95, 0.95),
                          noise_cfg=dict(sigma_dist=0., sigma_offaxis=0., sigma_floor=0., dropout_prob=0.))
         mpc = LandingMPC()
         obs, _ = env.reset(seed=7)
-        for _ in range(801):
+        for _ in range(2401):
             cmd = mpc.command(obs[:3], obs[3:6])
             action = [cmd[0]/2, cmd[1]/2, 2*(cmd[2]+0.8)/2.3-1]
             obs, _, terminated, truncated, info = env.step(action)

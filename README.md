@@ -87,3 +87,36 @@ python3 -m rl_vls.tools.analyze_flight_log runs/flight_logs/实际日志名.csv
 
 `flight_log_enabled`（默认 true）与 `flight_log_dir`（默认 `runs/flight_logs`）控制记录。
 日志队列有界，写入失败不阻断控制；分析阈值与无图模式可通过 `--help` 查看。
+
+
+## MPC 模型与当前 SITL 参数
+
+MPC 使用带指令延迟队列的一阶速度模型，默认预测 60 步（20 Hz 下为 3 秒）。
+按当前飞行日志调整的 ROS 默认值如下；独立 `LandingMPC` 类的视觉尺度默认仍为 1.0，
+适用于真值米制的 Python 仿真。
+
+| 参数 | ROS 默认值 | 含义 |
+| --- | --- | --- |
+| `mpc_tau_xy` / `mpc_tau_z` | `0.6` / `0.4` | 速度响应时间常数，s |
+| `mpc_delay_xy` / `mpc_delay_z` | `0.3` / `0.15` | 模型中的等效指令延迟，s |
+| `mpc_visual_scale` | `0.73` | 视觉位移/实际位移比例；输入除以该值转为模型米制 |
+| `mpc_descent_speed` | `0.3` | 最大下降参考速度，m/s |
+| `mpc_align_radius` / `mpc_align_speed` | `0.5` / `0.2` | 允许下降的水平误差/速度范围，m 与 m/s |
+| `mpc_max_accel_xy` / `mpc_max_accel_z` | `0.4` / `0.4` | 速度指令变化率上限，m/s² |
+| `mpc_position_weight_xy` / `mpc_velocity_weight_xy` | `2.0` / `4.0` | 水平位置/速度代价权重 |
+
+MPC 优先使用新鲜 ENU 实际速度旋转到水平机体系，以匹配补偿后的视觉观测；
+没有对应遥测时回退到 FLU 速度。下降同时考虑水平偏差和速度，避免高速掠过靶标时下降。
+日志新增校准后的 `mpc_position_*`、`mpc_velocity_*` 和 `mpc_descent_gate`，便于诊断。
+自动 QLAND 的 2 m 阈值仍使用原始尺度的补偿后视觉高度。
+
+尺度和时间常数是当前场景的近似拟合，需要随视觉标定、飞控参数变化重新校验。
+视觉模块本身的尺度标定应优先修正；输入已是正确米制时，将 `mpc_visual_scale` 设为 1.0。
+对比多次飞行及拟合诊断：
+
+```bash
+python3 -m rl_vls.tools.compare_flight_logs
+```
+
+输出 `runs/flight_logs/comparison/` 下的 Markdown/JSON 报告和曲线（绘图需 matplotlib）。
+初始条件、下降速度、速度限幅和 QLAND 交接高度应保持一致后再比较控制器。

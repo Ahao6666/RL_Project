@@ -89,7 +89,7 @@ class FlightLoggingTest(unittest.TestCase):
         samples = []
         node = SimpleNamespace(
             flight_recorder=SimpleNamespace(error=None, record=lambda stamp, row: samples.append(row)),
-            controller='mpc', yaw=0., mav_state=SimpleNamespace(armed=True, connected=True, mode='QLAND'),
+            controller='mpc', mpc=None, yaw=0., mav_state=SimpleNamespace(armed=True, connected=True, mode='QLAND'),
             extended_state=SimpleNamespace(landed_state=2), marker_status='accepted', _outlier_count=0,
             marker_stamp_ns=1_000_000_000, marker_raw_stamp_ns=1_000_000_000,
             vel_stamp_ns=1_000_000_000, vel_enu_stamp_ns=1_000_000_000,
