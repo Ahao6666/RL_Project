@@ -2,7 +2,7 @@ import csv
 import json
 import math
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -96,7 +96,10 @@ class FlightLoggingTest(unittest.TestCase):
             pose_stamp_ns=1_000_000_000, state_stamp_ns=1_000_000_000,
             extended_state_stamp_ns=1_000_000_000,
             marker_raw=[0, 0, 1.9], p_cam=[0, 0, 1.9], vel_flu=[1, 2, 3],
-            vel_enu=[1, 2, 3], pos_enu=[4, 5, 6], quat=[1, 0, 0, 0])
+            vel_enu=[1, 2, 3], pos_enu=[4, 5, 6], quat=[1, 0, 0, 0],
+            get_parameter=lambda name: SimpleNamespace(value={'visual_scale': 1.0}[name]))
+        # _record_flight_sample 会调用 _rl_p_cam()（视觉尺度补偿）
+        node._rl_p_cam = MethodType(LandingRLNode._rl_p_cam, node)
         LandingRLNode._record_flight_sample(node, 1_100_000_000, None, 'landing', True)
         self.assertEqual(samples[-1]['cmd_published'], 0)
         self.assertTrue(math.isnan(samples[-1]['cmd_enu_east']))

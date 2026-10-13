@@ -66,7 +66,13 @@ class MPCTest(unittest.TestCase):
         self.assertTrue(all(np.all(history == 0.) for history in mpc.command_history))
 
     def test_prediction_matches_environment(self):
+        # 关闭 RL 指令整形（接近段限速 + 加速度限制），否则环境会先把指令斜坡化，
+        # 与 MPC 内部“指令立即生效”的线性模型不一致；本测试只验证机体模型。
         env = LandingEnv(tau_xy_range=(1.3, 1.3), tau_z_range=(0.95, 0.95),
+                         cmd_filter_alpha=1.0, action_delay_range=(0, 0),
+                         descent_gate_radius=0.0, visual_scale_range=(1.0, 1.0),
+                         cmd_rate_max=1e9, approach_speed_gain=0.0,
+                         approach_speed_floor=1e9,
                          noise_cfg=dict(dropout_prob=0.))
         env.reset(seed=4)
         env.pos = np.array([0.2, -0.1, 5.])
@@ -78,7 +84,9 @@ class MPCTest(unittest.TestCase):
         for axis, (F, G, _, _, _) in enumerate(mpc.models):
             predictions.append(F @ [initial_p[axis], initial_v[axis]] + G @ commands[:, axis])
         for k, cmd in enumerate(commands):
-            env.step([cmd[0]/2, cmd[1]/2, 2*(cmd[2]+0.8)/2.3-1])
+            action = [cmd[0]/env.v_xy_max, cmd[1]/env.v_xy_max,
+                      2*(cmd[2]+env.v_up_max)/(env.v_down_max+env.v_up_max) - 1]
+            env.step(action)
             for axis in range(3):
                 np.testing.assert_allclose(
                     predictions[axis][2*k:2*k+2],
@@ -94,12 +102,17 @@ class MPCTest(unittest.TestCase):
 
     def test_closed_loop_landing(self):
         env = LandingEnv(max_episode_time=120., tau_xy_range=(1.3, 1.3), tau_z_range=(0.95, 0.95),
+                         cmd_filter_alpha=1.0, action_delay_range=(0, 0),
+                         descent_gate_radius=0.0, visual_scale_range=(1.0, 1.0),
+                         handoff_altitude=0.15, handoff_hold_s=0.05,
+                         handoff_radius=0.3, handoff_speed_xy=0.5,
                          noise_cfg=dict(sigma_dist=0., sigma_offaxis=0., sigma_floor=0., dropout_prob=0.))
         mpc = LandingMPC()
         obs, _ = env.reset(seed=7)
         for _ in range(2401):
             cmd = mpc.command(obs[:3], obs[3:6])
-            action = [cmd[0]/2, cmd[1]/2, 2*(cmd[2]+0.8)/2.3-1]
+            action = [cmd[0]/env.v_xy_max, cmd[1]/env.v_xy_max,
+                      2*(cmd[2]+env.v_up_max)/(env.v_down_max+env.v_up_max) - 1]
             obs, _, terminated, truncated, info = env.step(action)
             if terminated or truncated:
                 break

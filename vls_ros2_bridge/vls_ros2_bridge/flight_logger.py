@@ -12,6 +12,8 @@ import time
 
 VECTORS = {
     'marker_raw': ('x', 'y', 'z'), 'marker': ('right', 'forward', 'height'),
+    'marker_rl': ('right', 'forward', 'height'),
+    'prev_action': ('right', 'forward', 'down'),
     'cmd_enu': ('east', 'north', 'up'), 'cmd_body': ('right', 'forward', 'down'),
     'vel_flu': ('forward', 'left', 'up'), 'vel_enu': ('east', 'north', 'up'),
     'pos_enu': ('east', 'north', 'up'), 'attitude': ('roll_deg', 'pitch_deg', 'yaw_deg'),
@@ -23,7 +25,8 @@ FIELDS = ['t_s', 'ros_time_ns', 'wall_time_ns', 'controller', 'phase', 'mode',
           'armed', 'connected', 'landed_state', 'cmd_published', 'marker_fresh',
           'marker_status', 'outlier_count', 'marker_stamp_ns', 'marker_raw_stamp_ns',
           'marker_age_s', 'vel_age_s', 'vel_enu_age_s', 'pose_age_s',
-          'state_age_s', 'landed_age_s', 'dropped_rows', 'mpc_descent_gate']
+          'state_age_s', 'landed_age_s', 'dropped_rows', 'mpc_descent_gate',
+          'rl_descent_gate']
 FIELDS += [f'{prefix}_{axis}' for prefix, axes in VECTORS.items() for axis in axes]
 
 
@@ -47,7 +50,7 @@ class FlightLogger:
         self.metadata_path = self.path.with_suffix('.json')
         self._metadata = dict(schema_version=2, controller=controller,
                               parameters=metadata or {}, dropped_rows=0,
-                              frames='marker: level camera estimate; mpc_position: calibrated physical metres; pose and cmd: ENU; velocity_body: FLU',
+                              frames='marker: level camera estimate; marker_rl: scale-compensated RL observation; mpc_position: calibrated physical metres; pose and cmd: ENU; velocity_body: FLU',
                               sampling='latest received telemetry at each control tick; ages use reception time, marker age uses frame time')
         self.metadata_path.write_text(json.dumps(self._metadata, indent=2, ensure_ascii=False, default=str), encoding='utf-8')
         self._file = self.path.open('x', newline='', encoding='utf-8')

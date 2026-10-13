@@ -25,9 +25,13 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import pickle
 from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import rclpy
@@ -35,6 +39,7 @@ from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from mavros_msgs.msg import ExtendedState, State
 from mavros_msgs.srv import CommandBool, SetMode
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
@@ -54,6 +59,18 @@ def yaw_from_quaternion(q) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def _fingerprint(path) -> dict | None:
+    """模型/归一化文件指纹，写入飞行日志便于事后确认部署的是哪个模型。"""
+    try:
+        p = Path(path)
+        st = p.stat()
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return None
+    return {"path": str(p), "size": st.st_size, "sha256_16": digest,
+            "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="seconds")}
+
+
 class LandingRLNode(Node):
     def __init__(self):
         super().__init__("landing_rl_node")
@@ -63,7 +80,7 @@ class LandingRLNode(Node):
         self.declare_parameter("flight_log_enabled", True)
         self.declare_parameter("flight_log_dir", "runs/flight_logs")
         self.declare_parameter("auto_land_enabled", True)
-        self.declare_parameter("auto_land_altitude", 2.0)  # 自动降落触发高度 (m)
+        self.declare_parameter("auto_land_altitude", 2.5)  # 自动降落触发高度 (m)，与契约 handoff_altitude 一致
         self.declare_parameter("auto_land_mode", "QLAND")
         self.declare_parameter("landing_retry_s", 1.0)
         self.declare_parameter("landing_request_timeout_s", 3.0)
@@ -75,6 +92,21 @@ class LandingRLNode(Node):
         self.declare_parameter("v_xy_max", 1.0)
         self.declare_parameter("v_down_max", 0.8)
         self.declare_parameter("v_up_max", 0.8)
+        # 与训练契约一致的部署参数（见 rl_vls/contract.py）：
+        # 视觉尺度补偿、指令低通滤波、下降门控，以及可选契约文件路径。
+        # visual_scale：视觉位移/实际位移；1.0 表示视觉已是物理米制。
+        self.declare_parameter("visual_scale", 1.0)
+        self.declare_parameter("descent_gate_radius", 0.5)
+        self.declare_parameter("descent_gate_speed", 0.4)
+        self.declare_parameter("cmd_filter_alpha", 0.25)
+        # 指令整形：把策略指令限在飞控可达范围内（与训练契约逐项一致）。
+        # 真机辨识（2026-10-13）：MPC 指令 ≤0.4~0.8 m/s² 时幅值比 0.9~1.4、等效
+        # 延迟仅 0.15~0.25 s；RL 指令要求 4~10 m/s² 时实测速度斜率被削平在
+        # ~1~1.3 m/s²，幅值只剩 0.40~0.53、多出 ~90° 相位 → 闭环 0.5 Hz 振荡。
+        self.declare_parameter("cmd_rate_max", 1.5)          # 指令最大变化率 (m/s²)
+        self.declare_parameter("approach_speed_gain", 1.0)   # 接近段限速斜率 (1/s)
+        self.declare_parameter("approach_speed_floor", 0.15)  # 接近段限速下限 (m/s)
+        self.declare_parameter("contract_path", "")
         # 话题 y 轴镜像补偿：2026-09-29 yaw 标定（yaw_calib.csv）发现该系统
         # /h_marker/position 的 y 与标准相机光轴系反号（视觉管线的符号问题，
         # 根治应修视觉节点；此处做补偿）
@@ -87,6 +119,14 @@ class LandingRLNode(Node):
         self.controller = self.get_parameter("controller").value
         if self.controller not in ("rl", "p", "hybrid", "fixed", "mpc"):
             raise ValueError("Unknown controller: " + self.controller)
+        # 加载部署契约（如提供），确保速度映射/滤波/整形/门控与训练一致
+        self._apply_contract()
+        # 指令整形缓存（契约可能已改写上面声明的参数，故在 _apply_contract 之后读）
+        self.dt = 1.0 / float(self.get_parameter("control_rate_hz").value)
+        self._shape_rate_max = float(self.get_parameter("cmd_rate_max").value)
+        self._shape_gain = float(self.get_parameter("approach_speed_gain").value)
+        self._shape_floor = float(self.get_parameter("approach_speed_floor").value)
+        self._v_shaped = np.zeros(3)
         for name, default in (("mpc_horizon", 60), ("mpc_tau_xy", 0.6),
                               ("mpc_tau_z", 0.4), ("mpc_descent_speed", 0.3),
                               ("mpc_align_radius", 0.5), ("mpc_iterations", 80),
@@ -95,7 +135,7 @@ class LandingRLNode(Node):
                               ("mpc_velocity_filter_tau", 0.1),
                               ("mpc_descent_filter_tau", 0.4),
                               ("mpc_command_smooth_w", 4.0), ("mpc_delay_xy", 0.3),
-                              ("mpc_delay_z", 0.15), ("mpc_visual_scale", 0.73),
+                              ("mpc_delay_z", 0.15), ("mpc_visual_scale", 1.0),
                               ("mpc_align_speed", 0.2), ("mpc_position_weight_xy", 2.0),
                               ("mpc_velocity_weight_xy", 4.0)):
             self.declare_parameter(name, default)
@@ -146,9 +186,7 @@ class LandingRLNode(Node):
         self.declare_parameter("marker_max_step", 0.4)
         self.declare_parameter("marker_max_step_per_m", 0.15)
         self._outlier_count = 0
-        # 指令低通滤波：v_filt = alpha*v_new + (1-alpha)*v_filt_prev，
-        # 抑制 bang-bang 策略输出的高频振荡；1.0=不滤波，0.2~0.5 合适
-        self.declare_parameter("cmd_filter_alpha", 0.25)
+        # 指令低通滤波状态；cmd_filter_alpha 参数已在上方按契约声明
         self._v_filt = np.zeros(3)
         self.quat = (1.0, 0.0, 0.0, 0.0)  # 完整姿态（反旋转用）
 
@@ -185,6 +223,22 @@ class LandingRLNode(Node):
                 self.obs_norm = (vn.obs_rms.mean, vn.obs_rms.var, vn.epsilon, vn.clip_obs)
             self.get_logger().info(f"已加载观测归一化: {vn_path}")
 
+        # 记录模型/归一化文件指纹，并在 ONNX 比同目录 .zip 旧时告警。
+        # 历史事故：重新训练后忘记重新导出 ONNX，SITL 实际跑的是旧策略，
+        # 表现为“悬停不下降/横向来回抽”（门控因误差过大始终关闭）。
+        self._model_fp = _fingerprint(model_path) if model_path else None
+        self._vecnorm_fp = _fingerprint(vn_path) if vn_path else None
+        for name, fp in (("model", self._model_fp), ("vecnormalize", self._vecnorm_fp)):
+            if fp:
+                self.get_logger().info(
+                    f"{name} 指纹: sha256[:16]={fp['sha256_16']} size={fp['size']} mtime={fp['mtime']}")
+        if model_path.endswith(".onnx"):
+            sibling = Path(model_path).with_suffix(".zip")
+            if sibling.exists() and Path(model_path).stat().st_mtime < sibling.stat().st_mtime:
+                self.get_logger().warn(
+                    f"{Path(model_path).name} 比 {sibling.name} 旧，可能忘记重新导出"
+                    f"（rl_vls/tools/export_onnx.py）——请确认部署的是最新训练的策略！")
+
         self.marker_raw = None
         self.marker_raw_stamp_ns = None
         self.marker_status = "missing"
@@ -213,6 +267,7 @@ class LandingRLNode(Node):
             request_timeout_s=self.get_parameter("landing_request_timeout_s").value,
             disarm_hold_s=self.get_parameter("disarm_ground_hold_s").value)
         self.prev_action = np.zeros(3, dtype=np.float32)
+        self._rl_gate = float("nan")
         self._last_dbg_ns = 0
 
         self.create_subscription(PointStamped, "/h_marker/position", self._marker_cb, 10)
@@ -230,14 +285,46 @@ class LandingRLNode(Node):
 
         if self.get_parameter("flight_log_enabled").value:
             try:
+                params = {name: parameter.value
+                          for name, parameter in self._parameters.items()}
+                if self._model_fp:
+                    params["model_fingerprint"] = self._model_fp
+                if self._vecnorm_fp:
+                    params["vecnormalize_fingerprint"] = self._vecnorm_fp
                 self.flight_recorder = FlightLogger(
-                    self.get_parameter("flight_log_dir").value, self.controller,
-                    {name: parameter.value for name, parameter in self._parameters.items()})
+                    self.get_parameter("flight_log_dir").value, self.controller, params)
                 self.get_logger().info(f"飞行日志: {self.flight_recorder.path}")
             except (OSError, ValueError) as exc:
                 self.get_logger().error(f"无法创建飞行日志，继续控制: {exc}")
         period = 1.0 / self.get_parameter("control_rate_hz").value
         self.create_timer(period, self._control_cb)
+
+    def _apply_contract(self):
+        """加载部署契约（训练保存的 env_config.json）。
+
+        若提供 contract_path，用其中 deploy 段的参数覆盖本节点参数，保证部署与
+        训练逐项一致（速度映射、控制频率、指令滤波、视觉尺度、下降门控、交接高度）。
+        无论是否加载成功，都打印生效的契约，便于与训练配置对比。
+        """
+        path = self.get_parameter("contract_path").value
+        source = "defaults"
+        if path:
+            try:
+                deploy = json.loads(Path(path).read_text(encoding="utf-8")).get("deploy", {})
+                for name, value in deploy.items():
+                    if self.has_parameter(name):
+                        self.set_parameters([Parameter(name, value=value)])
+                    else:
+                        self.declare_parameter(name, value)
+                source = path
+            except (OSError, ValueError, KeyError) as exc:
+                self.get_logger().error(f"读取 contract_path 失败，沿用默认参数: {exc}")
+        keys = ("control_rate_hz", "v_xy_max", "v_down_max", "v_up_max",
+                "cmd_filter_alpha", "cmd_rate_max", "approach_speed_gain",
+                "approach_speed_floor", "visual_scale", "descent_gate_radius",
+                "descent_gate_speed", "auto_land_altitude")
+        effective = {key: self.get_parameter(key).value for key in keys}
+        self.get_logger().info(f"执行器契约 (来源: {source}): {effective}")
 
     # -------------------------------------------------------------- #
     # FLU 机体系 -> 相机光轴系（图像x右=机体右, 图像y下=机体前, z沿光轴向下）
@@ -346,7 +433,7 @@ class LandingRLNode(Node):
             now_ns*1e-9, armed=self.mav_state.armed, mode=self.mav_state.mode,
             state_fresh=self.mav_state.connected and fresh(
                 self.state_stamp_ns, self.get_parameter("landing_state_timeout_s").value),
-            marker_altitude=float(self.p_cam[2]) if self.p_cam is not None else None,
+            marker_altitude=self._handoff_altitude(),
             marker_fresh=marker_fresh,
             on_ground=self.extended_state.landed_state == ExtendedState.LANDED_STATE_ON_GROUND,
             ground_fresh=fresh(self.extended_state_stamp_ns,
@@ -355,14 +442,87 @@ class LandingRLNode(Node):
                 if self.extended_state_stamp_ns is not None else None)
 
     # -------------------------------------------------------------- #
+    def _rl_p_cam(self) -> np.ndarray:
+        """RL 观测用的视觉目标位置（补偿到物理米制）。
+
+        视觉位移约为实际位移的 visual_scale 倍，除以该值后与训练环境的物理米制
+        观测一致；visual_scale=1.0 表示视觉已是物理米制。
+        """
+        if self.p_cam is None:
+            return np.zeros(3, dtype=np.float32)
+        scale = float(self.get_parameter("visual_scale").value)
+        if scale > 0.0 and scale != 1.0:
+            return (self.p_cam / scale).astype(np.float32)
+        return np.asarray(self.p_cam, dtype=np.float32)
+
+    def _rl_velocity(self) -> np.ndarray:
+        """与训练环境一致的水平机体系 [右, 前, 下] 速度。
+
+        优先用新鲜 ENU 实测速度旋转到水平机体系（与 MPC 一致），消除机体倾斜
+        导致的位置/速度坐标不一致；无对应遥测时回退到机体系 FLU [-y, x, -z]。
+        """
+        now_ns = self.get_clock().now().nanoseconds
+        if (self.vel_enu_stamp_ns is not None and self.pose_stamp_ns is not None
+                and 0 <= (now_ns - self.vel_enu_stamp_ns) * 1e-9 < 0.2
+                and 0 <= (now_ns - self.pose_stamp_ns) * 1e-9 < 0.2
+                and np.all(np.isfinite(self.vel_enu))):
+            c, sine = math.cos(self.yaw), math.sin(self.yaw)
+            return np.array([self.vel_enu[0] * sine - self.vel_enu[1] * c,
+                             self.vel_enu[0] * c + self.vel_enu[1] * sine,
+                             -self.vel_enu[2]], dtype=np.float64)
+        return np.array([-self.vel_flu[1], self.vel_flu[0], -self.vel_flu[2]],
+                        dtype=np.float64)
+
+    def _shape_command(self, v_cmd: np.ndarray, d_xy: float) -> np.ndarray:
+        """指令整形：接近段限速 + 加速度（斜率）限制。
+
+        与训练环境 ``LandingEnv._shape_command`` 逐项一致（参数取契约
+        ``cmd_rate_max`` / ``approach_speed_gain`` / ``approach_speed_floor``）。
+
+        动机（2026-10-13 真机低频辨识）：飞控对速度目标可达的加速度约 1~2.5 m/s²。
+        策略输出的 ±1 m/s、~2 s 周期继电方波等效要求 4~10 m/s²，被削成慢三角波
+        （幅值只剩 0.40~0.53、多出 ~90° 相位 → 拟合成 +0.5 s 假延迟），闭环因此
+        变成 0.5 Hz 极限环。同一机体 MPC 通路指令 ≤0.4~0.8 m/s²，幅值比 0.9~1.4、
+        等效延迟仅 0.15~0.25 s——区别就在指令是否超出飞控线性区。
+        """
+        cap_xy = self._shape_gain * d_xy + self._shape_floor
+        hspeed = float(np.hypot(v_cmd[0], v_cmd[1]))
+        if 0.0 < cap_xy < hspeed:
+            scale = cap_xy / hspeed
+            v_cmd = np.array([v_cmd[0] * scale, v_cmd[1] * scale, v_cmd[2]])
+        max_step = self._shape_rate_max * self.dt
+        self._v_shaped = self._v_shaped + np.clip(v_cmd - self._v_shaped, -max_step, max_step)
+        return self._v_shaped
+
+    def _rl_descent_gate(self, d_xy: float, horiz_speed: float) -> float:
+        """下降门控：与训练环境 LandingEnv._descent_gate 逐项一致（平方软因子）。"""
+        radius = float(self.get_parameter("descent_gate_radius").value)
+        if radius <= 0.0:
+            return 1.0
+        ratio = min(d_xy / radius, 1.0)
+        gate = 1.0 - ratio * ratio
+        max_speed = float(self.get_parameter("descent_gate_speed").value)
+        if max_speed > 0.0:
+            ratio_v = min(horiz_speed / max_speed, 1.0)
+            gate *= 1.0 - ratio_v * ratio_v
+        return float(np.clip(gate, 0.0, 1.0))
+
+    def _handoff_altitude(self):
+        """交给 QLAND 的高度：RL/hybrid 用补偿后的物理高度，其余用原始视觉高度。"""
+        if self.p_cam is None:
+            return None
+        if self.controller in ("rl", "hybrid"):
+            return float(self._rl_p_cam()[2])
+        return float(self.p_cam[2])
+
     def _build_obs(self) -> np.ndarray:
         """组装与 LandingEnv 一致的 10 维观测：p_cam(3)+vel(3)+prev_action(3)+stale(1)。
 
-        训练环境的速度观测定义在 [右, 前, 下] 方向；
-        velocity_body 实测为 FLU [x前, y左, z上]，故 [右,前,下] = [-y, x, -z]。
+        视觉与速度都换算到训练环境约定的物理米制水平机体系 [右, 前, 下]：
+        p_cam 用 _rl_p_cam()（尺度补偿），速度用 _rl_velocity()（ENU 旋转或 FLU 换轴）。
         """
-        vel_env = np.array([-self.vel_flu[1], self.vel_flu[0], -self.vel_flu[2]])
-        obs = np.concatenate([self.p_cam, vel_env, self.prev_action, [0.0]]).astype(np.float32)
+        vel_env = self._rl_velocity()
+        obs = np.concatenate([self._rl_p_cam(), vel_env, self.prev_action, [0.0]]).astype(np.float32)
         if self.obs_norm is not None:
             mean, var, eps, clip = self.obs_norm
             obs = (obs - mean) / np.sqrt(var + eps)
@@ -378,6 +538,7 @@ class LandingRLNode(Node):
     def _control_cb(self):
         cmd = Twist()
         effective_controller = "idle"
+        self._rl_gate = float("nan")
 
         now_ns = self.get_clock().now().nanoseconds
         require_guided = self.get_parameter("require_guided").value
@@ -419,7 +580,7 @@ class LandingRLNode(Node):
             mode = self.controller
             if mode == "hybrid":
                 hybrid_alt = self.get_parameter("hybrid_alt").value
-                mode = "rl" if float(self.p_cam[2]) > hybrid_alt else "p"
+                mode = "rl" if float(self._rl_p_cam()[2]) > hybrid_alt else "p"
             effective_controller = mode
             if mode == "fixed":
                 v_right = self.get_parameter("fixed_v_right").value
@@ -491,12 +652,33 @@ class LandingRLNode(Node):
                         f"outliers={self._outlier_count}"
                     )
 
-            # 指令低通滤波：抑制高频振荡分量（在限幅前对机体系速度滤波）
+            # 指令整形（RL 通路）：接近段限速 + 加速度限制，顺序与训练环境一致
+            # （整形 → 滤波 → 门控 → 发布）。动机见 _shape_command 注释。
+            if mode == "rl":
+                d_xy_cmd = float(np.hypot(*self._rl_p_cam()[:2]))
+                v_right, v_forward, v_down = self._shape_command(
+                    np.array([v_right, v_forward, v_down]), d_xy_cmd)
+
+            # 指令低通滤波：默认 cmd_filter_alpha=1.0 关闭（改由上面速率限制整形）；
+            # 若回退到 <1.0，则抑制高频振荡分量
             alpha = self.get_parameter("cmd_filter_alpha").value
             if alpha < 1.0 and self.controller != "mpc":
                 self._v_filt = alpha * np.array([v_right, v_forward, v_down]) \
                     + (1.0 - alpha) * self._v_filt
                 v_right, v_forward, v_down = float(self._v_filt[0]), float(self._v_filt[1]), float(self._v_filt[2])
+
+            # 下降门控（RL）：未对准或横向速度过大时抑制下降，与训练环境一致；
+            # 上升/悬停不受限。用补偿后的物理米制水平偏差与水平速度判定。
+            if mode == "rl":
+                if v_down > 0.0:
+                    p_cam_phys = self._rl_p_cam()
+                    d_xy = float(np.hypot(p_cam_phys[0], p_cam_phys[1]))
+                    hspeed = float(np.hypot(*self._rl_velocity()[:2]))
+                    gate = self._rl_descent_gate(d_xy, hspeed)
+                    v_down *= gate
+                    self._rl_gate = gate
+                else:
+                    self._rl_gate = 1.0
 
             # 限幅
             v_xy_max = self.get_parameter("v_xy_max").value
@@ -513,8 +695,9 @@ class LandingRLNode(Node):
             cmd.linear.y = v_forward * sin_y - v_right * cos_y   # 北
             cmd.linear.z = -v_down                               # 上为正
         else:
-            # 非激活状态：滤波器归零，下次激活从零速起步，避免旧值残存
+            # 非激活状态：滤波器/整形状态归零，下次激活从零速起步，避免旧值残存
             self._v_filt = np.zeros(3)
+            self._v_shaped = np.zeros(3)
             if self.mpc is not None:
                 self.mpc.reset()
             # 诊断：每 3s 打印一次未激活原因（此时没有 [RL] 日志，否则无法定位）
@@ -559,13 +742,16 @@ class LandingRLNode(Node):
                    vel_enu_age_s=age(self.vel_enu_stamp_ns), pose_age_s=age(self.pose_stamp_ns),
                    state_age_s=age(self.state_stamp_ns), landed_age_s=age(self.extended_state_stamp_ns))
         row['mpc_descent_gate'] = self.mpc.descent_gate if self.mpc is not None else float('nan')
+        row['rl_descent_gate'] = getattr(self, '_rl_gate', float('nan'))
         vectors = dict(mpc_position=self.mpc.filtered_position if self.mpc is not None else None,
                        mpc_velocity=self.mpc.filtered_velocity if self.mpc is not None else None,
                        marker_raw=self.marker_raw, marker=self.p_cam, cmd_enu=cmd_enu,
                        cmd_body=cmd_body, vel_flu=self.vel_flu if self.vel_stamp_ns is not None else None,
                        vel_enu=self.vel_enu, pos_enu=self.pos_enu,
                        attitude=quaternion_degrees(self.quat) if self.pose_stamp_ns is not None else None,
-                       quat=self.quat if self.pose_stamp_ns is not None else None)
+                       quat=self.quat if self.pose_stamp_ns is not None else None,
+                       marker_rl=self._rl_p_cam() if self.p_cam is not None else None,
+                       prev_action=getattr(self, 'prev_action', None))
         for prefix, axes in VECTORS.items():
             values = vectors[prefix]
             if values is not None:

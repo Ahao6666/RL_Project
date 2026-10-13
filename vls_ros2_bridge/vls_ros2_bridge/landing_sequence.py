@@ -9,7 +9,7 @@ import math
 
 
 class LandingSequence:
-    def __init__(self, request_land, request_disarm, logger, altitude=2.0,
+    def __init__(self, request_land, request_disarm, logger, altitude=2.5,
                  land_mode='QLAND', retry_s=1.0, request_timeout_s=3.0,
                  disarm_hold_s=1.0):
         if not all(math.isfinite(x) and x > 0 for x in

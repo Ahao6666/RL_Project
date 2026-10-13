@@ -51,10 +51,10 @@ class SequenceTest(unittest.TestCase):
     def test_default_qland_handoff_before_visual_loss(self):
         sequence = LandingSequence(lambda mode: self.request('land', mode),
                                    lambda: self.request('disarm', False), self.logger)
-        data = dict(self.data, mode='GUIDED', marker_altitude=2.0)
+        data = dict(self.data, mode='GUIDED', marker_altitude=2.5)
         self.assertFalse(sequence.update(1., **data))
         self.assertEqual(self.calls, [])
-        data['marker_altitude'] = 1.9
+        data['marker_altitude'] = 2.4
         self.assertTrue(sequence.update(1.1, **data))
         self.assertEqual(self.calls, [('land', 'QLAND')])
         data.update(mode='QLAND', marker_fresh=False)
@@ -163,7 +163,13 @@ class SequenceTest(unittest.TestCase):
             with self.subTest(controller=controller):
                 self.setUp()
                 params = dict(auto_land_enabled=True, require_guided=True,
-                              marker_timeout=1., landing_state_timeout_s=2., landed_state_timeout_s=1.5)
+                              marker_timeout=1., landing_state_timeout_s=2., landed_state_timeout_s=1.5,
+                              control_rate_hz=20., v_xy_max=1., v_down_max=0.8, v_up_max=0.8,
+                              cmd_filter_alpha=1.0, visual_scale=1.0,
+                              descent_gate_radius=0.5, descent_gate_speed=0.6,
+                              cmd_rate_max=1.5, approach_speed_gain=1.0, approach_speed_floor=0.15,
+                              kp_xy=0.3, p_align_radius=0.5, p_descent_vel=0.3, p_min_alt=0.3,
+                              hybrid_alt=3.0, fixed_v_right=0.5, fixed_v_forward=0., fixed_v_down=0.)
                 clock = [1_000_000_000]
                 published = []
                 node = SimpleNamespace(
@@ -173,12 +179,21 @@ class SequenceTest(unittest.TestCase):
                     state_stamp_ns=clock[0], p_cam=np.array([0., 0., 0.29]),
                     marker_stamp_ns=clock[0], extended_state=ExtendedState(),
                     extended_state_stamp_ns=None, _v_filt=np.ones(3),
-                    prev_action=np.ones(3),
+                    _v_shaped=np.zeros(3), prev_action=np.ones(3),
+                    yaw=0., vel_flu=np.zeros(3), vel_enu=np.zeros(3),
+                    vel_enu_stamp_ns=clock[0], pose_stamp_ns=clock[0],
+                    _rl_gate=float('nan'), _last_dbg_ns=0,
+                    dt=1.0 / params['control_rate_hz'],
+                    _shape_rate_max=params['cmd_rate_max'],
+                    _shape_gain=params['approach_speed_gain'],
+                    _shape_floor=params['approach_speed_floor'],
                     get_parameter=lambda name: SimpleNamespace(value=params[name]),
                     get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=clock[0])),
                     cmd_pub=SimpleNamespace(publish=published.append),
                     _record_flight_sample=lambda *args: None)
-                node._landing_step = MethodType(LandingRLNode._landing_step, node)
+                for name in ('_landing_step', '_handoff_altitude', '_rl_p_cam',
+                             '_rl_descent_gate', '_rl_velocity', '_shape_command'):
+                    setattr(node, name, MethodType(getattr(LandingRLNode, name), node))
                 LandingRLNode._control_cb(node)
                 self.assertEqual(self.calls, [('land', 'LAND')])
                 self.assertEqual(len(published), 1)
